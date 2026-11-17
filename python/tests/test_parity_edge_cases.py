@@ -21,6 +21,7 @@ from _parity_cases import (
     Point,
     bufferless_empty,
     bufferless_nested,
+    binary_metadata_cases,
     extension_conflicts,
     nested_dictionary_schema,
     nul_name_batch,
@@ -301,3 +302,33 @@ def test_a_prepared_schema_tells_names_cut_at_nul_apart():
         cut_prepared.hash_record_batch(nul_name_batch(schema, rows))
     with pytest.raises(ValueError, match="does not match"):
         ArrowDigester.prepare(schema).hash_record_batch(nul_name_batch(cut, rows))
+
+
+# --- metadata that is not UTF-8 ------------------------------------------------------------
+
+BINARY_METADATA = binary_metadata_cases()
+
+
+@pytest.mark.parametrize("case", sorted(BINARY_METADATA))
+def test_metadata_that_is_not_utf8_is_ignored_unless_hashed(case):
+    batch = BINARY_METADATA[case]
+    plain = pa.schema([without_metadata(field) for field in batch.schema])
+    plain_batch = pa.RecordBatch.from_arrays(batch.columns, schema=plain)
+    table = pa.Table.from_batches([batch, batch])
+    # Without include_metadata it is not read (it was decoded, and refused, on import).
+    assert ArrowDigester.hash_schema(batch.schema) == ArrowDigester.hash_schema(plain)
+    expected = ArrowDigester.hash_record_batch(plain_batch)
+    assert ArrowDigester.hash_record_batch(batch) == expected
+    assert ArrowDigester.prepare(batch.schema).hash_record_batch(batch) == expected
+    assert ArrowDigester.hash_table(table) == ArrowDigester.hash_table(pa.Table.from_batches([plain_batch] * 2))
+    assert ArrowDigester.hash_array(batch.column(0)) == ArrowDigester.hash_array(plain_batch.column(0))
+    # With it, starfix-python's UnicodeDecodeError.
+    for call in (
+        lambda: ArrowDigester.hash_schema(batch.schema, include_metadata=True),
+        lambda: ArrowDigester.prepare(batch.schema, include_metadata=True),
+        lambda: ArrowDigester(batch.schema, include_metadata=True),
+        lambda: ArrowDigester.hash_record_batch(batch, include_metadata=True),
+        lambda: ArrowDigester.hash_table(table, include_metadata=True),
+    ):
+        with pytest.raises(UnicodeDecodeError):
+            call()
