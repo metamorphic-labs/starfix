@@ -21,6 +21,17 @@
   three options as keywords.
 - `examples/prepared_bench.rs`: time per one-row hash, one-shot and prepared.
 
+### Added — a `Result` API (ITL-1178)
+
+- `StarfixError`, and `try_*` variants that return it instead of panicking:
+  `ArrowDigester::try_new`, `try_update`, `try_hash_schema`, `try_hash_record_batch`,
+  `try_hash_array_with_config`, and `PreparedSchema::try_new`, `try_hash_record_batch`,
+  `try_digester`. Every refusal of the spec (Sections 5, 7 and 8) is a variant. The panicking
+  methods are unchanged and panic with the error's message.
+- `update` is atomic: a refused batch (for example a null in a non-nullable field, found while
+  the batch is traversed) leaves the digester as it was, so it can be used further. Before, its
+  state was unspecified. The state is saved per node, not per row.
+
 ### Fixed — the Python binding of this crate (`python/starfix`, ITL-1178)
 
 **Hashes produced through this binding change with this release for multi-chunk tables, and

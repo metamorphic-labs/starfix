@@ -1,7 +1,6 @@
 #![expect(
     clippy::expect_used,
-    clippy::todo,
-    reason = "First iteration of code, will add proper error handling later. Allow for unsupported data types for now"
+    reason = "Internal invariants of valid Arrow data; refusals of input are `StarfixError`s"
 )]
 use std::{
     collections::{BTreeMap, HashSet},
@@ -23,6 +22,9 @@ use arrow_schema::{Field, SchemaRef};
 use bitvec::prelude::*;
 use digest::Digest;
 
+#[cfg(test)]
+use crate::error::or_panic;
+use crate::error::StarfixError;
 use crate::{HasherConfig, VERSION_BYTES};
 
 const DELIMITER_FOR_NESTED_FIELD: &str = "/";
@@ -102,6 +104,36 @@ impl<D: Digest> DigestBufferType<D> {
             Some(d) => d,
             None => panic!("data digest not present on this entry"),
         }
+    }
+}
+
+/// The state of one node entry before an update, to restore it when the update is refused:
+/// the digests (a few hundred bytes) and the length of the validity bits (bits are only ever
+/// appended, so truncating, and clearing the unused bits of the last byte, restores them). Per
+/// node, never per row.
+struct EntryState<D: Digest> {
+    null_bits_len: Option<usize>,
+    structural: Option<D>,
+    data: Option<D>,
+}
+
+impl<D: Digest + Clone> EntryState<D> {
+    fn of(entry: &DigestBufferType<D>) -> Self {
+        Self {
+            null_bits_len: entry.null_bits.as_ref().map(BitVec::len),
+            structural: entry.structural.clone(),
+            data: entry.data.clone(),
+        }
+    }
+
+    fn restore(self, entry: &mut DigestBufferType<D>) {
+        if let (Some(bits), Some(len)) = (entry.null_bits.as_mut(), self.null_bits_len) {
+            bits.truncate(len);
+            // The raw bytes are hashed: clear the bits past the end that the refused batch set.
+            bits.set_uninitialized(false);
+        }
+        entry.structural = self.structural;
+        entry.data = self.data;
     }
 }
 
@@ -186,11 +218,11 @@ impl<D: Digest + Clone> SchemaAnalysis<D> {
     /// the equality key, check type support (Section 8; reported by `assert_data_supported`) and
     /// lay out the node entries. Every step runs once.
     ///
-    /// # Panics
-    /// As `ArrowDigester::hash_schema`.
-    pub fn new(schema: SchemaRef, config: HasherConfig) -> Self {
+    /// # Errors
+    /// As `ArrowDigester::try_hash_schema`.
+    pub fn try_new(schema: SchemaRef, config: HasherConfig) -> Result<Self, StarfixError> {
         // Section 7 first, then the schema texts and digest (as `hash_schema`)
-        ArrowDigesterCore::<D>::validate_schema_paths(&schema);
+        ArrowDigesterCore::<D>::validate_schema_paths(&schema)?;
         let normalized = normalize_schema(&schema);
         let (phase1, phase2) = ArrowDigesterCore::<D>::phase_texts(&normalized, config);
         let schema_digest =
@@ -210,25 +242,25 @@ impl<D: Digest + Clone> SchemaAnalysis<D> {
             ArrowDigesterCore::<D>::extract_fields_name(field, &mut entries_template);
         }
 
-        Self {
+        Ok(Self {
             schema,
             config,
             schema_digest,
             schema_equality_key,
             entries_template,
             unsupported_data_type,
-        }
+        })
     }
 
-    /// Reject a schema whose data cannot be hashed (byte-layout spec Section 8), before any data
-    /// is hashed: the rejection of `ArrowDigester::new`, found once by the analysis.
+    /// Refuse a schema whose data cannot be hashed (byte-layout spec Section 8), before any data
+    /// is hashed: the refusal of `ArrowDigester::new`, found once by the analysis.
     ///
-    /// # Panics
+    /// # Errors
     /// On `Null`, `Map`, `Interval`, view and other unsupported types anywhere in the schema.
-    pub fn assert_data_supported(&self) {
-        if let Some(other) = &self.unsupported_data_type {
-            todo!("hashing data of type {other} is not supported")
-        }
+    pub fn check_data_supported(&self) -> Result<(), StarfixError> {
+        self.unsupported_data_type.as_ref().map_or(Ok(()), |other| {
+            Err(StarfixError::UnsupportedData(other.clone()))
+        })
     }
 
     pub const fn schema(&self) -> &SchemaRef {
@@ -256,11 +288,11 @@ impl<D: Digest + Clone> SchemaAnalysis<D> {
     ///    passed Section 7;
     /// 3. otherwise the batch schema's key is built and compared, and Section 7 is checked.
     ///
-    /// # Panics
+    /// # Errors
     /// When tier 3 finds that the batch's schema fails Section 7.
-    pub fn matches(&self, rb_schema: &SchemaRef) -> bool {
+    pub fn try_matches(&self, rb_schema: &SchemaRef) -> Result<bool, StarfixError> {
         if Arc::ptr_eq(rb_schema, &self.schema) || **rb_schema == *self.schema {
-            return true;
+            return Ok(true);
         }
         let config = self.config;
         // Without metadata, `canonical_schema_json` normalizes types internally via
@@ -276,9 +308,9 @@ impl<D: Digest + Clone> SchemaAnalysis<D> {
         if matches {
             // An unordered top level is keyed by name, so a batch with duplicate column names
             // can match the key; reject it like the analysed schema.
-            ArrowDigesterCore::<D>::validate_schema_paths(rb_schema);
+            ArrowDigesterCore::<D>::validate_schema_paths(rb_schema)?;
         }
-        matches
+        Ok(matches)
     }
 }
 
@@ -303,45 +335,92 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     }
 
     /// Create a new instance of `ArrowDigesterCore` with the schema, which will be enforced through each update.
+    #[cfg(test)]
     pub fn new_with_config(schema: &Schema, config: HasherConfig) -> Self {
-        Self::from_analysis(Arc::new(SchemaAnalysis::new(
+        or_panic(Self::try_new_with_config(schema, config))
+    }
+
+    /// `new_with_config`, returning the refusal.
+    ///
+    /// # Errors
+    /// As `ArrowDigester::try_new`.
+    pub fn try_new_with_config(
+        schema: &Schema,
+        config: HasherConfig,
+    ) -> Result<Self, StarfixError> {
+        Self::try_from_analysis(Arc::new(SchemaAnalysis::try_new(
             Arc::new(schema.clone()),
             config,
-        )))
+        )?))
     }
 
     /// A fresh digester of an existing analysis: no schema work.
     ///
-    /// # Panics
-    /// When the schema's data cannot be hashed (`SchemaAnalysis::assert_data_supported`).
-    pub fn from_analysis(analysis: Arc<SchemaAnalysis<D>>) -> Self {
-        analysis.assert_data_supported();
-        Self {
+    /// # Errors
+    /// When the schema's data cannot be hashed (`SchemaAnalysis::check_data_supported`).
+    pub fn try_from_analysis(analysis: Arc<SchemaAnalysis<D>>) -> Result<Self, StarfixError> {
+        analysis.check_data_supported()?;
+        Ok(Self {
             fields_digest_buffer: analysis.entries_template.clone(),
             analysis,
             row_count: 0,
-        }
+        })
     }
 
-    /// Hash a record batch and update the internal digests.
+    /// `try_update`, panicking with the error's message (the digester is left as it was).
     ///
     /// # Panics
-    /// When the batch's schema does not match (byte-layout spec Section 5), and as
-    /// `update_matched`.
+    /// As `try_update`.
+    #[cfg(test)]
     pub fn update(&mut self, record_batch: &RecordBatch) {
-        assert!(
-            self.analysis.matches(record_batch.schema_ref()),
-            "Record batch schema does not match ArrowDigester schema"
-        );
-        self.update_matched(record_batch);
+        or_panic(self.try_update(record_batch));
+    }
+
+    /// Hash a record batch and update the internal digests. A refused batch leaves the digester
+    /// as it was.
+    ///
+    /// # Errors
+    /// When the batch's schema does not match (byte-layout spec Section 5), and as
+    /// `try_update_matched`.
+    pub fn try_update(&mut self, record_batch: &RecordBatch) -> Result<(), StarfixError> {
+        if !self.analysis.try_matches(record_batch.schema_ref())? {
+            return Err(StarfixError::SchemaMismatch);
+        }
+        self.try_update_matched(record_batch)
     }
 
     /// `update` for a batch whose schema the caller has already matched against the analysis.
-    pub fn update_matched(&mut self, record_batch: &RecordBatch) {
-        self.row_count = self
+    /// A refused batch leaves the digester as it was: the digests and validity lengths are
+    /// saved first (per node, not per row) and restored on a refusal.
+    ///
+    /// # Errors
+    /// When a non-nullable field holds a null that no enclosing null struct masks, or the row
+    /// count overflows.
+    pub fn try_update_matched(&mut self, record_batch: &RecordBatch) -> Result<(), StarfixError> {
+        let saved: Vec<EntryState<D>> = self
+            .fields_digest_buffer
+            .values()
+            .map(EntryState::of)
+            .collect();
+        let result = self.ingest(record_batch);
+        if result.is_err() {
+            for (entry, state) in self.fields_digest_buffer.values_mut().zip(saved) {
+                state.restore(entry);
+            }
+        }
+        result
+    }
+
+    /// Add a batch whose schema is known to match, without saving the digester's state: on a
+    /// refusal the digester is left partly updated and must be discarded (a one-shot hash).
+    ///
+    /// # Errors
+    /// As `try_update_matched`.
+    pub fn ingest(&mut self, record_batch: &RecordBatch) -> Result<(), StarfixError> {
+        let row_count = self
             .row_count
             .checked_add(record_batch.num_rows() as u64)
-            .expect("row count overflow");
+            .ok_or(StarfixError::RowCountOverflow)?;
 
         let schema = record_batch.schema_ref();
         for col_idx in 0..record_batch.num_columns() {
@@ -356,8 +435,10 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 &path,
                 None, // no ancestor struct nulls at top level
                 &mut self.fields_digest_buffer,
-            );
+            )?;
         }
+        self.row_count = row_count;
+        Ok(())
     }
 
     /// Hash an array directly without needing to create an `ArrowDigester` instance on the user side.
@@ -376,8 +457,27 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         Self::hash_array_with_config(array, HasherConfig::default())
     }
 
-    /// `hash_array` with options (byte-layout spec Section 4). `include_metadata` has no effect.
+    /// `try_hash_array_with_config`, panicking with the error's message.
+    ///
+    /// # Panics
+    /// As `try_hash_array_with_config`.
+    #[cfg(test)]
     pub fn hash_array_with_config(array: &dyn Array, config: HasherConfig) -> Vec<u8> {
+        or_panic(Self::try_hash_array_with_config(array, config))
+    }
+
+    /// `hash_array` with options (byte-layout spec Section 4). `include_metadata` has no effect.
+    ///
+    /// # Errors
+    /// As `ArrowDigester::try_hash_array_with_config`.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "The `expect`s are internal invariants; refusals of input are returned"
+    )]
+    pub fn try_hash_array_with_config(
+        array: &dyn Array,
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
         let flags = option_flags(config);
         let effective_type = array.data_type().clone();
         let effective_array = array;
@@ -385,8 +485,8 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         // Normalize to canonical large types
         let normalized_type = normalize_data_type(&effective_type);
 
-        Self::validate_type_paths(&normalized_type);
-        Self::validate_data_type(&normalized_type);
+        Self::validate_type_paths(&normalized_type)?;
+        Self::validate_data_type(&normalized_type)?;
 
         let mut final_digest = D::new();
         final_digest.update(header(KIND_ARRAY, flags));
@@ -415,24 +515,31 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             "",
             None,
             &mut fields,
-        );
+        )?;
 
         // Finalize all entries into the digest (same order as record-batch finalize)
         for (_, digest) in fields {
             Self::finalize_digest(&mut final_digest, digest);
         }
 
-        final_digest.finalize().to_vec()
+        Ok(final_digest.finalize().to_vec())
     }
 
     /// Hash a record batch directly without needing to create an `ArrowDigester` instance on the user side.
-    pub fn hash_record_batch(record_batch: &RecordBatch, config: HasherConfig) -> Vec<u8> {
-        // The analysis is of the batch's own schema object: the check in `update` is the
-        // pointer comparison, so the schema is analysed once.
-        let mut digester =
-            Self::from_analysis(Arc::new(SchemaAnalysis::new(record_batch.schema(), config)));
-        digester.update(record_batch);
-        digester.finalize()
+    ///
+    /// # Errors
+    /// As `ArrowDigester::try_hash_record_batch`.
+    pub fn try_hash_record_batch(
+        record_batch: &RecordBatch,
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
+        // The analysis is of the batch's own schema: nothing to match.
+        let mut digester = Self::try_from_analysis(Arc::new(SchemaAnalysis::try_new(
+            record_batch.schema(),
+            config,
+        )?))?;
+        digester.ingest(record_batch)?;
+        Ok(digester.finalize())
     }
 
     /// Consume the digester and produce the final digest: the schema digest, the row count, then
@@ -633,10 +740,16 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// maps are empty, preserving the empty-metadata invariant.
     ///
     /// `normalize_schema` preserves metadata, so the normalized schema is used for both phases.
-    pub fn hash_schema_with_config(schema: &Schema, config: HasherConfig) -> Vec<u8> {
-        Self::validate_schema_paths(schema);
+    ///
+    /// # Errors
+    /// As `ArrowDigester::try_hash_schema`.
+    pub fn try_hash_schema_with_config(
+        schema: &Schema,
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
+        Self::validate_schema_paths(schema)?;
         let (phase1, phase2) = Self::phase_texts(&normalize_schema(schema), config);
-        Self::schema_digest_of(&phase1, phase2.as_deref(), config)
+        Ok(Self::schema_digest_of(&phase1, phase2.as_deref(), config))
     }
 
     /// The Phase 1 canonical schema JSON and, with `include_metadata`, the Phase 2 metadata
@@ -809,6 +922,10 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     }
 
     /// Top-down recursive traversal that routes data to `BTreeMap` entries.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "The `expect`s are internal invariants; refusals of input are returned"
+    )]
     fn traverse_and_update(
         data_type: &DataType,
         nullable: bool,
@@ -816,7 +933,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) {
+    ) -> Result<(), StarfixError> {
         // Normalize small variants
         let (normalized_type, cast_array);
         let (effective_type, effective_array): (&DataType, &dyn Array) = match data_type {
@@ -860,45 +977,37 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         let canonical = normalize_data_type(effective_type);
 
         match &canonical {
-            DataType::LargeList(value_field) => {
-                Self::traverse_list(
-                    effective_array,
-                    value_field,
-                    nullable,
-                    path,
-                    ancestor_struct_nulls,
-                    fields,
-                );
-            }
-            DataType::FixedSizeList(value_field, _) => {
-                Self::traverse_fixed_size_list(
-                    effective_array,
-                    value_field,
-                    nullable,
-                    path,
-                    ancestor_struct_nulls,
-                    fields,
-                );
-            }
-            DataType::Struct(_) => {
-                Self::traverse_struct(
-                    effective_array,
-                    nullable,
-                    path,
-                    ancestor_struct_nulls,
-                    fields,
-                );
-            }
-            _ => {
-                Self::traverse_leaf(
-                    effective_type,
-                    effective_array,
-                    nullable,
-                    path,
-                    ancestor_struct_nulls,
-                    fields,
-                );
-            }
+            DataType::LargeList(value_field) => Self::traverse_list(
+                effective_array,
+                value_field,
+                nullable,
+                path,
+                ancestor_struct_nulls,
+                fields,
+            ),
+            DataType::FixedSizeList(value_field, _) => Self::traverse_fixed_size_list(
+                effective_array,
+                value_field,
+                nullable,
+                path,
+                ancestor_struct_nulls,
+                fields,
+            ),
+            DataType::Struct(_) => Self::traverse_struct(
+                effective_array,
+                nullable,
+                path,
+                ancestor_struct_nulls,
+                fields,
+            ),
+            _ => Self::traverse_leaf(
+                effective_type,
+                effective_array,
+                nullable,
+                path,
+                ancestor_struct_nulls,
+                fields,
+            ),
         }
     }
 
@@ -910,7 +1019,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) {
+    ) -> Result<(), StarfixError> {
         let dictionary = array.as_any_dictionary();
         let values = dictionary.values();
         // An empty dictionary can only have null keys; normalized_keys requires values.
@@ -934,8 +1043,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 path,
                 ancestor.as_ref(),
                 fields,
-            );
+            )?;
         }
+        Ok(())
     }
 
     /// A list node: [validity] and the lengths of its valid elements go into its own entry; the
@@ -950,7 +1060,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) {
+    ) -> Result<(), StarfixError> {
         if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
             Self::traverse_list_of(
                 list,
@@ -959,7 +1069,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 path,
                 ancestor_struct_nulls,
                 fields,
-            );
+            )
         } else {
             let list = array
                 .as_any()
@@ -972,7 +1082,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 path,
                 ancestor_struct_nulls,
                 fields,
-            );
+            )
         }
     }
 
@@ -983,10 +1093,11 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) where
+    ) -> Result<(), StarfixError>
+    where
         O: OffsetSizeTrait,
     {
-        Self::assert_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls);
+        Self::check_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls)?;
 
         let effective_nulls = Self::combine_nulls(list_array.nulls(), ancestor_struct_nulls);
         let entry = fields
@@ -1041,14 +1152,19 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 &element_path,
                 None, // list elements don't have ancestor struct nulls
                 fields,
-            );
+            )?;
         }
+        Ok(())
     }
 
     /// A fixed-size-list node (byte-layout spec Section 3.2): its entry is its validity if
     /// nullable and nothing else (no lengths: every valid slot has `n` items, and `n` is in the
     /// schema). The element node at `path/` then receives the `n` items of every effectively
     /// valid slot, in order; items of null slots are never visited, whatever they hold.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "The `expect`s are internal invariants; refusals of input are returned"
+    )]
     fn traverse_fixed_size_list(
         array: &dyn Array,
         value_field: &Field,
@@ -1056,12 +1172,12 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) {
+    ) -> Result<(), StarfixError> {
         let list_array = array
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .expect("downcast to FixedSizeListArray");
-        Self::assert_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls);
+        Self::check_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls)?;
 
         let effective_nulls = Self::combine_nulls(list_array.nulls(), ancestor_struct_nulls);
         if nullable {
@@ -1107,8 +1223,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 &element_path,
                 None, // a fixed-size list starts a new list level: no ancestor struct nulls
                 fields,
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn offset_at<O>(offsets: &[O], i: usize) -> usize
@@ -1133,22 +1250,26 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// A non-nullable node may only have nulls where an enclosing struct is null (byte-layout
     /// spec Section 7).
     ///
-    /// # Panics
+    /// # Errors
     /// When a non-nullable field's array has a null that no enclosing struct null masks.
-    fn assert_nulls_allowed(
+    fn check_nulls_allowed(
         nullable: bool,
         own_nulls: Option<&NullBuffer>,
         ancestor: Option<&NullBuffer>,
-    ) {
+    ) -> Result<(), StarfixError> {
         if nullable {
-            return;
+            return Ok(());
         }
         let Some(own) = own_nulls.filter(|nb| nb.null_count() > 0) else {
-            return;
+            return Ok(());
         };
         let masked =
             ancestor.is_some_and(|anc| (own.inner() | &!anc.inner()).count_set_bits() == own.len());
-        assert!(masked, "A non-nullable field contains null values");
+        if masked {
+            Ok(())
+        } else {
+            Err(StarfixError::NonNullableNull)
+        }
     }
 
     fn traverse_struct(
@@ -1157,13 +1278,13 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) {
+    ) -> Result<(), StarfixError> {
         let struct_array = array
             .as_any()
             .downcast_ref::<StructArray>()
             .expect("downcast to StructArray");
 
-        Self::assert_nulls_allowed(nullable, struct_array.nulls(), ancestor_struct_nulls);
+        Self::check_nulls_allowed(nullable, struct_array.nulls(), ancestor_struct_nulls)?;
 
         // Combine struct's own nulls with ancestor nulls (AND propagation)
         let combined_nulls = if nullable {
@@ -1205,8 +1326,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 &child_path,
                 combined_nulls.as_ref(),
                 fields,
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn traverse_leaf(
@@ -1216,8 +1338,8 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
-    ) {
-        Self::assert_nulls_allowed(nullable, array.nulls(), ancestor_struct_nulls);
+    ) -> Result<(), StarfixError> {
+        Self::check_nulls_allowed(nullable, array.nulls(), ancestor_struct_nulls)?;
         let entry = fields
             .get_mut(path)
             .expect("entry must exist for leaf path");
@@ -1228,6 +1350,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             Self::push_validity(null_bits, effective_nulls.as_ref(), array.len());
         }
         Self::hash_leaf_values(data_type, array, effective_nulls.as_ref(), entry.data_mut());
+        Ok(())
     }
 
     fn combine_nulls(
@@ -1439,12 +1562,11 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// Reject types whose data cannot be hashed (byte-layout spec Section 8), before any data is
     /// hashed, whatever the number of rows.
     ///
-    /// # Panics
+    /// # Errors
     /// On `Null`, `Map`, `Interval`, view and other unsupported types anywhere in the type tree.
-    fn validate_data_type(data_type: &DataType) {
-        if let Some(other) = Self::unsupported_data_type(data_type) {
-            todo!("hashing data of type {other} is not supported")
-        }
+    fn validate_data_type(data_type: &DataType) -> Result<(), StarfixError> {
+        Self::unsupported_data_type(data_type)
+            .map_or(Ok(()), |other| Err(StarfixError::UnsupportedData(other)))
     }
 
     /// The first type in the type tree whose data cannot be hashed (normalized), if any.
@@ -1488,71 +1610,76 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// Reject schemas that cannot be hashed unambiguously (byte-layout spec Section 7), in every
     /// mode.
     ///
-    /// # Panics
+    /// # Errors
     /// When two nodes of the type tree share a node path (duplicate names, or a name containing
     /// `/` that aliases a nested field), or when the schema contains a `ListView`,
     /// `LargeListView`, `Union` or `RunEndEncoded` type.
-    fn validate_schema_paths(schema: &Schema) {
+    fn validate_schema_paths(schema: &Schema) -> Result<(), StarfixError> {
         let mut seen = HashSet::new();
         for field in schema.fields() {
-            Self::claim_node_path(field.name(), &mut seen);
-            Self::collect_node_paths(field.data_type(), field.name(), &mut seen);
+            Self::claim_node_path(field.name(), &mut seen)?;
+            Self::collect_node_paths(field.data_type(), field.name(), &mut seen)?;
         }
+        Ok(())
     }
 
     /// `hash_array` variant of `validate_schema_paths`: the array itself is the node at `""`.
-    fn validate_type_paths(data_type: &DataType) {
+    fn validate_type_paths(data_type: &DataType) -> Result<(), StarfixError> {
         let mut seen = HashSet::new();
-        Self::claim_node_path("", &mut seen);
-        Self::collect_node_paths(data_type, "", &mut seen);
+        Self::claim_node_path("", &mut seen)?;
+        Self::collect_node_paths(data_type, "", &mut seen)
     }
 
-    fn claim_node_path(path: &str, seen: &mut HashSet<String>) {
-        assert!(
-            seen.insert(path.to_owned()),
-            "Ambiguous field path {path:?}: duplicate field names, or a field name containing \
-             {DELIMITER_FOR_NESTED_FIELD:?} that collides with a nested field, cannot be hashed"
-        );
+    fn claim_node_path(path: &str, seen: &mut HashSet<String>) -> Result<(), StarfixError> {
+        if seen.insert(path.to_owned()) {
+            Ok(())
+        } else {
+            Err(StarfixError::AmbiguousPath(path.to_owned()))
+        }
     }
 
-    fn collect_node_paths(data_type: &DataType, path: &str, seen: &mut HashSet<String>) {
+    fn collect_node_paths(
+        data_type: &DataType,
+        path: &str,
+        seen: &mut HashSet<String>,
+    ) -> Result<(), StarfixError> {
         let canonical = normalize_data_type(data_type);
-        assert!(
-            !matches!(
-                canonical,
-                DataType::ListView(_)
-                    | DataType::LargeListView(_)
-                    | DataType::Union(_, _)
-                    | DataType::RunEndEncoded(_, _)
-            ),
-            "ListView, LargeListView, Union and RunEndEncoded types cannot be hashed"
-        );
+        if matches!(
+            canonical,
+            DataType::ListView(_)
+                | DataType::LargeListView(_)
+                | DataType::Union(_, _)
+                | DataType::RunEndEncoded(_, _)
+        ) {
+            return Err(StarfixError::UnsupportedType);
+        }
         match canonical {
             DataType::Struct(children) => {
                 for child in &children {
                     let child_path = Self::construct_field_name_hierarchy(path, child.name());
-                    Self::claim_node_path(&child_path, seen);
-                    Self::collect_node_paths(child.data_type(), &child_path, seen);
+                    Self::claim_node_path(&child_path, seen)?;
+                    Self::collect_node_paths(child.data_type(), &child_path, seen)?;
                 }
             }
             DataType::LargeList(element) | DataType::FixedSizeList(element, _) => {
                 let element_path = format!("{path}{DELIMITER_FOR_NESTED_FIELD}");
-                Self::claim_node_path(&element_path, seen);
-                Self::collect_node_paths(element.data_type(), &element_path, seen);
+                Self::claim_node_path(&element_path, seen)?;
+                Self::collect_node_paths(element.data_type(), &element_path, seen)?;
             }
             DataType::Map(entries, _) => {
                 let entries_path = format!("{path}{DELIMITER_FOR_NESTED_FIELD}");
-                Self::claim_node_path(&entries_path, seen);
+                Self::claim_node_path(&entries_path, seen)?;
                 if let DataType::Struct(kv) = entries.data_type() {
                     for (child, name) in kv.iter().zip(["key", "value"]) {
                         let child_path = Self::construct_field_name_hierarchy(&entries_path, name);
-                        Self::claim_node_path(&child_path, seen);
-                        Self::collect_node_paths(child.data_type(), &child_path, seen);
+                        Self::claim_node_path(&child_path, seen)?;
+                        Self::collect_node_paths(child.data_type(), &child_path, seen)?;
                     }
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Path of a struct child: always `parent + "/" + name` (byte-layout spec Section 3.1), so

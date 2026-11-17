@@ -10,6 +10,7 @@ use arrow_schema::{Schema, SchemaRef};
 use sha2::Sha256;
 
 use crate::arrow_digester_core::{ArrowDigesterCore, SchemaAnalysis};
+use crate::error::or_panic;
 
 /// Hash format version: the first 3 bytes of every hash, a 24-bit big-endian format number,
 /// independent of the crate version. Format 1 (`00 00 01`): starfix 0.4 and earlier. Format 2
@@ -49,7 +50,8 @@ pub struct HasherConfig {
 /// # Panics
 ///
 /// The rejections are the same in every mode (`docs/byte-layout-spec.md`, Section 7); each method
-/// lists its own under `# Panics`. After a panic, discard the digester.
+/// lists its own under `# Panics`; each has a `try_*` variant returning [`StarfixError`] instead. A
+/// refused `update` leaves the digester as it was.
 #[derive(Clone)]
 pub struct ArrowDigester {
     digester: ArrowDigesterCore<Sha256>,
@@ -67,9 +69,19 @@ impl ArrowDigester {
     /// - the schema contains a type whose data is not supported (`Null`, `Map`, `Interval`,
     ///   `Utf8View`, `BinaryView`).
     pub fn new(schema: &Schema, config: HasherConfig) -> Self {
-        Self {
-            digester: ArrowDigesterCore::<Sha256>::new_with_config(schema, config),
-        }
+        or_panic(Self::try_new(schema, config))
+    }
+
+    /// [`Self::new`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::AmbiguousPath`], [`StarfixError::UnsupportedType`] or
+    /// [`StarfixError::UnsupportedData`], in the cases listed under [`Self::new`].
+    pub fn try_new(schema: &Schema, config: HasherConfig) -> Result<Self, StarfixError> {
+        Ok(Self {
+            digester: ArrowDigesterCore::<Sha256>::try_new_with_config(schema, config)?,
+        })
     }
 
     /// Analyse `schema` once under `config`, for hashing many record batches of that schema, or
@@ -94,9 +106,23 @@ impl ArrowDigester {
     /// - a non-nullable field holds a null at an element that no enclosing null struct masks;
     /// - the total row count overflows `u64`.
     ///
-    /// After a panic the digester's state is unspecified: discard it.
+    /// A refused batch leaves the digester as it was (the panic can be caught and the digester
+    /// used further).
     pub fn update(&mut self, record_batch: &RecordBatch) {
-        self.digester.update(record_batch);
+        or_panic(self.try_update(record_batch));
+    }
+
+    /// [`Self::update`], returning the refusal instead of panicking. A refused batch leaves the
+    /// digester as it was: the per-node state is saved before the batch is hashed and restored
+    /// on a refusal (a cost per node, not per row).
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::SchemaMismatch`], [`StarfixError::AmbiguousPath`],
+    /// [`StarfixError::UnsupportedType`], [`StarfixError::NonNullableNull`] or
+    /// [`StarfixError::RowCountOverflow`], in the cases listed under [`Self::update`].
+    pub fn try_update(&mut self, record_batch: &RecordBatch) -> Result<(), StarfixError> {
+        self.digester.try_update(record_batch)
     }
 
     /// Consume the digester and finalize the hash computation.
@@ -131,9 +157,22 @@ impl ArrowDigester {
     /// - a non-nullable field inside the array holds a null at an element that no enclosing null
     ///   struct masks.
     pub fn hash_array_with_config(array: &dyn Array, config: HasherConfig) -> Vec<u8> {
-        Self::prepend_version_bytes(ArrowDigesterCore::<Sha256>::hash_array_with_config(
-            array, config,
-        ))
+        or_panic(Self::try_hash_array_with_config(array, config))
+    }
+
+    /// [`Self::hash_array_with_config`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::AmbiguousPath`], [`StarfixError::UnsupportedType`],
+    /// [`StarfixError::UnsupportedData`] or [`StarfixError::NonNullableNull`], in the cases
+    /// listed under [`Self::hash_array_with_config`].
+    pub fn try_hash_array_with_config(
+        array: &dyn Array,
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
+        ArrowDigesterCore::<Sha256>::try_hash_array_with_config(array, config)
+            .map(Self::prepend_version_bytes)
     }
 
     /// Hash a complete `RecordBatch` in one go.
@@ -148,10 +187,22 @@ impl ArrowDigester {
     ///   `Utf8View`, `BinaryView`), whatever the number of rows;
     /// - a non-nullable field holds a null at an element that no enclosing null struct masks.
     pub fn hash_record_batch(record_batch: &RecordBatch, config: HasherConfig) -> Vec<u8> {
-        Self::prepend_version_bytes(ArrowDigesterCore::<Sha256>::hash_record_batch(
-            record_batch,
-            config,
-        ))
+        or_panic(Self::try_hash_record_batch(record_batch, config))
+    }
+
+    /// [`Self::hash_record_batch`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::AmbiguousPath`], [`StarfixError::UnsupportedType`],
+    /// [`StarfixError::UnsupportedData`] or [`StarfixError::NonNullableNull`], in the cases
+    /// listed under [`Self::hash_record_batch`].
+    pub fn try_hash_record_batch(
+        record_batch: &RecordBatch,
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
+        ArrowDigesterCore::<Sha256>::try_hash_record_batch(record_batch, config)
+            .map(Self::prepend_version_bytes)
     }
 
     /// Hash a schema only.
@@ -163,9 +214,18 @@ impl ArrowDigester {
     ///   names, or a name containing `/` that aliases a nested field);
     /// - the schema contains a `ListView`, `LargeListView`, `Union` or `RunEndEncoded` type.
     pub fn hash_schema(schema: &Schema, config: HasherConfig) -> Vec<u8> {
-        Self::prepend_version_bytes(ArrowDigesterCore::<Sha256>::hash_schema_with_config(
-            schema, config,
-        ))
+        or_panic(Self::try_hash_schema(schema, config))
+    }
+
+    /// [`Self::hash_schema`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::AmbiguousPath`] or [`StarfixError::UnsupportedType`], in the cases
+    /// listed under [`Self::hash_schema`].
+    pub fn try_hash_schema(schema: &Schema, config: HasherConfig) -> Result<Vec<u8>, StarfixError> {
+        ArrowDigesterCore::<Sha256>::try_hash_schema_with_config(schema, config)
+            .map(Self::prepend_version_bytes)
     }
 
     fn prepend_version_bytes(digest: Vec<u8>) -> Vec<u8> {
@@ -219,9 +279,18 @@ impl PreparedSchema {
     ///
     /// As [`ArrowDigester::hash_schema`].
     pub fn new(schema: &Schema, config: HasherConfig) -> Self {
-        Self {
-            analysis: Arc::new(SchemaAnalysis::new(Arc::new(schema.clone()), config)),
-        }
+        or_panic(Self::try_new(schema, config))
+    }
+
+    /// [`Self::new`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArrowDigester::try_hash_schema`].
+    pub fn try_new(schema: &Schema, config: HasherConfig) -> Result<Self, StarfixError> {
+        Ok(Self {
+            analysis: Arc::new(SchemaAnalysis::try_new(Arc::new(schema.clone()), config)?),
+        })
     }
 
     /// The prepared schema. A record batch built with this `SchemaRef` passes the same-schema
@@ -253,13 +322,26 @@ impl PreparedSchema {
     ///   match the prepared schema";
     /// - a non-nullable field holds a null at an element that no enclosing null struct masks.
     pub fn hash_record_batch(&self, record_batch: &RecordBatch) -> Vec<u8> {
-        let mut digester = ArrowDigesterCore::from_analysis(Arc::clone(&self.analysis));
-        assert!(
-            self.analysis.matches(record_batch.schema_ref()),
-            "Record batch schema does not match the prepared schema"
-        );
-        digester.update_matched(record_batch);
-        ArrowDigester::prepend_version_bytes(digester.finalize())
+        or_panic(self.try_hash_record_batch(record_batch))
+    }
+
+    /// [`Self::hash_record_batch`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::UnsupportedData`], [`StarfixError::PreparedSchemaMismatch`],
+    /// [`StarfixError::AmbiguousPath`], [`StarfixError::UnsupportedType`] or
+    /// [`StarfixError::NonNullableNull`], in the cases listed under [`Self::hash_record_batch`].
+    pub fn try_hash_record_batch(
+        &self,
+        record_batch: &RecordBatch,
+    ) -> Result<Vec<u8>, StarfixError> {
+        let mut digester = ArrowDigesterCore::try_from_analysis(Arc::clone(&self.analysis))?;
+        if !self.analysis.try_matches(record_batch.schema_ref())? {
+            return Err(StarfixError::PreparedSchemaMismatch);
+        }
+        digester.ingest(record_batch)?;
+        Ok(ArrowDigester::prepend_version_bytes(digester.finalize()))
     }
 
     /// A fresh streaming digester of the prepared schema, without analysing it again: hashes
@@ -270,9 +352,19 @@ impl PreparedSchema {
     /// When the prepared schema contains a type whose data is not supported, as
     /// [`ArrowDigester::new`].
     pub fn digester(&self) -> ArrowDigester {
-        ArrowDigester {
-            digester: ArrowDigesterCore::from_analysis(Arc::clone(&self.analysis)),
-        }
+        or_panic(self.try_digester())
+    }
+
+    /// [`Self::digester`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`StarfixError::UnsupportedData`] when the prepared schema contains a type whose data is
+    /// not supported.
+    pub fn try_digester(&self) -> Result<ArrowDigester, StarfixError> {
+        Ok(ArrowDigester {
+            digester: ArrowDigesterCore::try_from_analysis(Arc::clone(&self.analysis))?,
+        })
     }
 }
 
@@ -286,6 +378,8 @@ impl fmt::Debug for PreparedSchema {
 }
 
 pub(crate) mod arrow_digester_core;
+mod error;
+pub use error::StarfixError;
 pub mod legacy;
 pub mod pyarrow;
 
