@@ -18,7 +18,7 @@ named differences say otherwise (`python/tests/_harness.py`, `EXPECTED_DIFFERENC
 against the published 0.5.0: `python/tests/test_differential.py` (in `ci.yml`, job
 `python-binding (newest pyarrow)`), and the seeded harness `python/tests/test_harness.py`
 (`differential-harness.yml`). The harness runs 2,000 seeds per leg on every pull request,
-50,000 nightly on `main`, and 50,000 in `maturin-release.yml` (job `differential-harness`),
+100,000 nightly on `main`, and 100,000 in `maturin-release.yml` (job `differential-harness`),
 which the publish jobs need: a tag that fails it publishes nothing.
 
 ## Who releases
@@ -42,7 +42,7 @@ the table above. Only the job that publishes declares that environment and gets
    crate to crates.io.
 3. The pushed tag `v<version>` triggers `ci.yml`, which checks that the tag matches `Cargo.toml`.
 4. The same tag triggers `maturin-release.yml`. It checks that the tag matches `Cargo.toml`,
-   builds and tests the wheels and the sdist, runs the 50,000-seed harness against starfix
+   builds and tests the wheels and the sdist, runs the 100,000-seed harness against starfix
    0.5.0, publishes them to TestPyPI (environment `testpypi`), and then to PyPI (environment
    `pypi`).
 
