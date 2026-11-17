@@ -25,30 +25,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # maturin is installed from PyPI and run directly: this repository allows only GitHub-owned
+  # actions, verified creators and a short list of others, which PyO3/maturin-action is not on.
   linux:
-    name: linux ${{ matrix.target }} ${{ matrix.libc }}
+    name: linux ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-24.04, target: x86_64, libc: manylinux, compatibility: auto, test: true }
-          - { runner: ubuntu-24.04-arm, target: aarch64, libc: manylinux, compatibility: auto, test: true }
+          # zig links against an old glibc / musl, so the wheels run on manylinux_2_17 / musllinux_1_2.
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, compatibility: manylinux2014, test: true }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, compatibility: manylinux2014, test: true }
           # pyarrow publishes no musllinux wheels, so these cannot be tested here (and need a
           # pyarrow built from source where they are used).
-          - { runner: ubuntu-24.04, target: x86_64, libc: musllinux, compatibility: musllinux_1_2, test: false }
-          - { runner: ubuntu-24.04-arm, target: aarch64, libc: musllinux, compatibility: musllinux_1_2, test: false }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, compatibility: musllinux_1_2, test: false }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, compatibility: musllinux_1_2, test: false }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
       - name: Build the wheel
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1
-        with:
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.compatibility }}
-          args: --release --out dist
+        run: |
+          rustup target add ${{ matrix.target }}
+          python -m venv .venv-build
+          .venv-build/bin/pip install "maturin[zig]>=1.9.6,<2"
+          .venv-build/bin/maturin build --release --out dist --zig \
+            --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }}
       - name: Test the wheel in a clean environment
         if: matrix.test
         run: |
@@ -57,7 +61,7 @@ jobs:
           .venv-test/bin/python -m pytest python/tests -q
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: wheels-linux-${{ matrix.target }}-${{ matrix.libc }}
+          name: wheels-${{ matrix.target }}
           path: dist
 
   macos:
@@ -70,10 +74,11 @@ jobs:
           python-version: '3.12'
       # One universal2 wheel (arm64 and x86_64); it is tested on this arm64 runner.
       - name: Build the wheel
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1
-        with:
-          target: universal2-apple-darwin
-          args: --release --out dist
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          python -m venv .venv-build
+          .venv-build/bin/pip install "maturin>=1.9.6,<2"
+          .venv-build/bin/maturin build --release --out dist --target universal2-apple-darwin
       - name: Test the wheel in a clean environment
         run: |
           python -m venv .venv-test
@@ -94,10 +99,11 @@ jobs:
           python-version: '3.12'
           architecture: x64
       - name: Build the wheel
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1
-        with:
-          target: x64
-          args: --release --out dist
+        shell: bash
+        run: |
+          python -m venv .venv-build
+          .venv-build/Scripts/python -m pip install "maturin>=1.9.6,<2"
+          .venv-build/Scripts/maturin build --release --out dist
       - name: Test the wheel in a clean environment
         shell: bash
         run: |
@@ -113,11 +119,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - name: Build the sdist
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
-          command: sdist
-          args: --out dist
+          python-version: '3.12'
+      - name: Build the sdist
+        run: |
+          python -m venv .venv-build
+          .venv-build/bin/pip install "maturin>=1.9.6,<2"
+          .venv-build/bin/maturin sdist --out dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: wheels-sdist
