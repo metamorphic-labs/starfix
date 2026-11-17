@@ -93,6 +93,15 @@ jobs:
         PYTHONPATH: ${{ github.workspace }}/python/tests/parity
       run: ../.venv-starfix/bin/python -m pytest -p starfix_python_private_stub tests -rs
 
+  differential-harness:
+    # The seeded differential harness against starfix-python 0.5.0 (python/tests/test_harness.py),
+    # pull request tier: 2,000 seeds on each leg (newest pyarrow; Python 3.10 with pyarrow 19).
+    # The release tier (50,000 seeds, sharded) runs nightly and before publishing.
+    uses: ./.github/workflows/differential-harness.yml
+    with:
+      seeds: 2000
+      shards: '[0]'
+
   verify-version-tag-sync:
     runs-on: ubuntu-latest
     # No job-level if: — always runs so downstream jobs are not skipped on workflow_dispatch.
