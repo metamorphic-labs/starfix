@@ -13,7 +13,8 @@ The inputs are the golden vectors, each in several chunks, and seeded random mul
 tables (nested types, dictionaries, metadata at every level, empty and sliced chunks, empty
 tables), unregistered ``ARROW:extension:*`` metadata, and inputs an IPC round trip would change
 (``_parity_cases``: empty descendants without buffers, registered extension types with
-conflicting metadata, repeated keys below nested dictionaries), built in each process. Skipped when ``STARFIX_PYTHON`` is unset, unless ``STARFIX_REQUIRE_DIFFERENTIAL`` is
+conflicting metadata, repeated keys below nested dictionaries, field names containing NUL),
+built in each process. Skipped when ``STARFIX_PYTHON`` is unset, unless ``STARFIX_REQUIRE_DIFFERENTIAL`` is
 set (as in CI), where it fails instead.
 """
 

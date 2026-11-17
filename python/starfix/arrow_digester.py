@@ -96,6 +96,45 @@ def _child_nodes(t: pa.DataType, path: str) -> list[tuple[str, pa.Field]]:
     return []
 
 
+_WRAPPERS = (pa.DictionaryType, pa.BaseExtensionType)
+
+
+def _type_has_nul_name(t: pa.DataType) -> bool:
+    """Whether a field name below type `t`, at any depth, contains NUL."""
+    t = _logical(t)
+    if pa.types.is_struct(t):
+        fields = [t.field(i) for i in range(t.num_fields)]
+    elif pa.types.is_map(t):
+        fields = [t.key_field, t.item_field]
+    else:
+        fields = [t.value_field] if hasattr(t, "value_field") else []
+    for field in fields:
+        if "\x00" in field.name:
+            return True
+        child = field.type
+        if (child.num_fields or isinstance(child, _WRAPPERS)) and _type_has_nul_name(child):
+            return True
+    return False
+
+
+def _has_nul_name(schema: pa.Schema) -> bool:
+    """Whether a field name of `schema`, at any depth, contains NUL.
+
+    The Arrow C Data Interface carries names as C strings, which end at the first NUL; for such
+    a schema the native module takes the names from pyarrow (they are hashed in full).
+    """
+    if any("\x00" in name for name in schema.names):
+        return True
+    return any(_type_has_nul_name(t) for t in schema.types if t.num_fields or isinstance(t, _WRAPPERS))
+
+
+def _full_names(schema: pa.Schema, analysed: pa.Schema, analysed_has_nul: bool) -> pa.Schema | None:
+    """`schema` when a name in it contains NUL (see `_has_nul_name`), else None; decided without
+    a walk when `schema` equals the `analysed` one (names included)."""
+    has_nul = analysed_has_nul if schema.equals(analysed) else _has_nul_name(schema)
+    return schema if has_nul else None
+
+
 def _check_extension_metadata(schema: pa.Schema) -> None:
     """Refuse explicit ``ARROW:extension:*`` field metadata that differs from what the field's
     registered extension type exports (spec Section 7 with ``include_metadata``, as
@@ -146,7 +185,7 @@ class ArrowDigester:
     ``ArrowDigester.prepare`` and hash through the returned ``PreparedSchema``.
     """
 
-    __slots__ = ("_digester",)
+    __slots__ = ("_digester", "_has_nul", "_schema")
 
     def __init__(
         self,
@@ -169,14 +208,23 @@ class ArrowDigester:
         """
         _require_little_endian()
         _require(schema, pa.Schema, "ArrowDigester", "a pyarrow.Schema")
+        has_nul = _has_nul_name(schema)
         self._digester = _internal.Digester(
-            schema, bool(include_metadata), bool(ordered_columns), bool(ordered_struct_fields)
+            schema,
+            bool(include_metadata),
+            bool(ordered_columns),
+            bool(ordered_struct_fields),
+            schema if has_nul else None,
         )
+        self._schema = schema
+        self._has_nul = has_nul
 
     @classmethod
-    def _from_internal(cls, digester: _internal.Digester) -> ArrowDigester:
+    def _from_internal(cls, digester: _internal.Digester, schema: pa.Schema, has_nul: bool) -> ArrowDigester:
         instance = cls.__new__(cls)
         instance._digester = digester
+        instance._schema = schema
+        instance._has_nul = has_nul
         return instance
 
     @staticmethod
@@ -204,12 +252,15 @@ class ArrowDigester:
         _require_little_endian()
         _require(schema, pa.Schema, "prepare", "a pyarrow.Schema")
         options = (bool(include_metadata), bool(ordered_columns), bool(ordered_struct_fields))
-        return PreparedSchema._create(schema, _internal.Prepared(schema, *options), options)
+        has_nul = _has_nul_name(schema)
+        prepared = _internal.Prepared(schema, *options, schema if has_nul else None)
+        return PreparedSchema._create(schema, prepared, options, has_nul)
 
     def update(self, record_batch: pa.RecordBatch) -> None:
         """Add a record batch. Splitting rows into batches does not change the hash."""
         _require(record_batch, pa.RecordBatch, "update", _BATCH_TYPE)
-        self._digester.update(_batch(record_batch))
+        batch = _batch(record_batch)
+        self._digester.update(batch, _full_names(batch.schema, self._schema, self._has_nul))
 
     def finalize(self) -> bytes:
         """Return the 35-byte hash of everything added so far."""
@@ -227,7 +278,11 @@ class ArrowDigester:
         _require_little_endian()
         _require(schema, pa.Schema, "hash_schema", "a pyarrow.Schema")
         return _internal.hash_schema(
-            schema, bool(include_metadata), bool(ordered_columns), bool(ordered_struct_fields)
+            schema,
+            bool(include_metadata),
+            bool(ordered_columns),
+            bool(ordered_struct_fields),
+            schema if _has_nul_name(schema) else None,
         )
 
     @staticmethod
@@ -241,8 +296,13 @@ class ArrowDigester:
         """Hash one record batch (equal to streaming it through a digester)."""
         _require(record_batch, pa.RecordBatch, "hash_record_batch", _BATCH_TYPE)
         _require_little_endian()
+        batch = _batch(record_batch)
         return _internal.hash_record_batch(
-            _batch(record_batch), bool(include_metadata), bool(ordered_columns), bool(ordered_struct_fields)
+            batch,
+            bool(include_metadata),
+            bool(ordered_columns),
+            bool(ordered_struct_fields),
+            batch.schema if _has_nul_name(batch.schema) else None,
         )
 
     @staticmethod
@@ -262,6 +322,7 @@ class ArrowDigester:
             bool(include_metadata),
             bool(ordered_columns),
             bool(ordered_struct_fields),
+            table.schema if _has_nul_name(table.schema) else None,
         )
 
     @staticmethod
@@ -279,8 +340,13 @@ class ArrowDigester:
         _require_little_endian()
         _require(array, (pa.Array, pa.ChunkedArray), "hash_array", "a pyarrow.Array or pyarrow.ChunkedArray")
         chunks = array.chunks if isinstance(array, pa.ChunkedArray) else [array]
+        t = array.type
         return _internal.hash_array(
-            array.type, [_array(chunk) for chunk in chunks], bool(ordered_columns), bool(ordered_struct_fields)
+            t,
+            [_array(chunk) for chunk in chunks],
+            bool(ordered_columns),
+            bool(ordered_struct_fields),
+            t if _type_has_nul_name(t) else None,
         )
 
 
@@ -305,14 +371,15 @@ class PreparedSchema:
     ``large_string`` one, are checked by computing their schema key.
     """
 
-    __slots__ = ("_options", "_prepared", "_schema")
+    __slots__ = ("_has_nul", "_options", "_prepared", "_schema")
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("PreparedSchema is created by ArrowDigester.prepare(schema, ...)")
 
     @classmethod
-    def _create(cls, schema: pa.Schema, prepared: _internal.Prepared, options: tuple) -> PreparedSchema:
+    def _create(cls, schema: pa.Schema, prepared: _internal.Prepared, options: tuple, has_nul: bool) -> PreparedSchema:
         instance = object.__new__(cls)
+        object.__setattr__(instance, "_has_nul", has_nul)
         object.__setattr__(instance, "_schema", schema)
         object.__setattr__(instance, "_prepared", prepared)
         object.__setattr__(instance, "_options", options)
@@ -365,16 +432,18 @@ class PreparedSchema:
     def hash_record_batch(self, record_batch: pa.RecordBatch) -> bytes:
         """Hash one record batch of this schema (see the same-schema rule)."""
         _require(record_batch, pa.RecordBatch, "hash_record_batch", _BATCH_TYPE)
-        return self._prepared.hash_record_batch(_batch(record_batch))
+        batch = _batch(record_batch)
+        return self._prepared.hash_record_batch(batch, _full_names(batch.schema, self._schema, self._has_nul))
 
     def hash_table(self, table: pa.Table) -> bytes:
         """Hash a table of this schema (see the same-schema rule)."""
         _require(table, pa.Table, "hash_table", _TABLE_TYPE)
-        return self._prepared.hash_table(table.schema, _batches_of(table))
+        full_names = _full_names(table.schema, self._schema, self._has_nul)
+        return self._prepared.hash_table(table.schema, _batches_of(table), full_names)
 
     def digester(self) -> ArrowDigester:
         """A fresh streaming ``ArrowDigester`` for this schema and options, without analysis."""
-        return ArrowDigester._from_internal(self._prepared.digester())
+        return ArrowDigester._from_internal(self._prepared.digester(), self._schema, self._has_nul)
 
 
 def _prepare(schema: pa.Schema, include_metadata: bool, ordered_columns: bool, ordered_struct_fields: bool) -> PreparedSchema:
