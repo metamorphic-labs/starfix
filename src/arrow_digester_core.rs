@@ -484,23 +484,38 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     ///
     /// # Errors
     /// As `ArrowDigester::try_hash_array_with_config`.
-    #[expect(
-        clippy::unwrap_in_result,
-        reason = "The `expect`s are internal invariants; refusals of input are returned"
-    )]
     pub fn try_hash_array_with_config(
         array: &dyn Array,
         config: HasherConfig,
     ) -> Result<Vec<u8>, StarfixError> {
+        Self::try_hash_array_chunks(array.data_type(), &[array], config)
+    }
+
+    /// `hash_array` of the concatenation of `chunks`, all of type `data_type`, without
+    /// concatenating them: every entry is a stream (byte-layout spec Section 3.3), so traversing
+    /// the chunks in order writes the bytes of their concatenation.
+    ///
+    /// # Errors
+    /// As `ArrowDigester::try_hash_array_chunks`.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "The `expect`s are internal invariants; refusals of input are returned"
+    )]
+    pub fn try_hash_array_chunks(
+        data_type: &DataType,
+        chunks: &[&dyn Array],
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
         let flags = option_flags(config);
-        let effective_type = array.data_type().clone();
-        let effective_array = array;
+        if let Some(chunk) = chunks.iter().find(|chunk| chunk.data_type() != data_type) {
+            return Err(StarfixError::ChunkTypeMismatch(chunk.data_type().clone()));
+        }
 
         // Normalize to canonical large types
-        let normalized_type = normalize_data_type(&effective_type);
+        let normalized_type = normalize_data_type(data_type);
 
         Self::validate_type_paths(&normalized_type)?;
-        Self::validate_data_type(&effective_type)?;
+        Self::validate_data_type(data_type)?;
 
         let mut final_digest = D::new();
         final_digest.update(header(KIND_ARRAY, flags));
@@ -513,23 +528,22 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             .expect("Failed to serialize data type to string");
 
         // Update the digest with array metadata, then the element count
+        let len = chunks
+            .iter()
+            .try_fold(0_u64, |total, chunk| total.checked_add(chunk.len() as u64))
+            .ok_or(StarfixError::RowCountOverflow)?;
         final_digest.update(data_type_serialized);
-        final_digest.update((effective_array.len() as u64).to_le_bytes());
+        final_digest.update(len.to_le_bytes());
 
         // Build BTreeMap entries from the type tree (same decomposition as record-batch path)
         let mut fields = BTreeMap::new();
         // The root is always nullable: its validity is always written (byte-layout spec Section 4)
-        Self::extract_type_entries(&effective_type, true, "", &mut fields);
+        Self::extract_type_entries(data_type, true, "", &mut fields);
 
-        // Traverse and populate entries
-        Self::traverse_and_update(
-            &effective_type,
-            true,
-            effective_array,
-            "",
-            None,
-            &mut fields,
-        )?;
+        // Traverse and populate entries, chunk after chunk
+        for chunk in chunks {
+            Self::traverse_and_update(data_type, true, *chunk, "", None, &mut fields)?;
+        }
 
         // Finalize all entries into the digest (same order as record-batch finalize)
         for (_, digest) in fields {

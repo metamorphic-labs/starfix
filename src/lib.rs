@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use sha2::Sha256;
 
 use crate::arrow_digester_core::{ArrowDigesterCore, SchemaAnalysis};
@@ -170,6 +170,37 @@ impl ArrowDigester {
         config: HasherConfig,
     ) -> Result<Vec<u8>, StarfixError> {
         ArrowDigesterCore::<Sha256>::try_hash_array_with_config(array, config)
+            .map(Self::prepend_version_bytes)
+    }
+
+    /// Hash the concatenation of `chunks`, every one of type `data_type` (for example the chunks
+    /// of a chunked column), without concatenating them: equal to
+    /// [`Self::hash_array_with_config`] of their concatenation. No chunks hash as an empty array
+    /// of the type.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::hash_array_with_config`], and when a chunk's type is not `data_type`.
+    pub fn hash_array_chunks(
+        data_type: &DataType,
+        chunks: &[&dyn Array],
+        config: HasherConfig,
+    ) -> Vec<u8> {
+        or_panic(Self::try_hash_array_chunks(data_type, chunks, config))
+    }
+
+    /// [`Self::hash_array_chunks`], returning the refusal instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_hash_array_with_config`], and [`StarfixError::ChunkTypeMismatch`] when a
+    /// chunk's type is not `data_type`.
+    pub fn try_hash_array_chunks(
+        data_type: &DataType,
+        chunks: &[&dyn Array],
+        config: HasherConfig,
+    ) -> Result<Vec<u8>, StarfixError> {
+        ArrowDigesterCore::<Sha256>::try_hash_array_chunks(data_type, chunks, config)
             .map(Self::prepend_version_bytes)
     }
 

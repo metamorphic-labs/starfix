@@ -300,4 +300,31 @@ mod tests {
             "Record batch schema does not match the prepared schema"
         );
     }
+
+    #[test]
+    fn chunks_hash_as_their_concatenation() {
+        let whole = batch(0, &[Some(1), Some(2), Some(3), Some(4)]);
+        for column in whole.columns() {
+            let (left, right) = (column.slice(0, 1), column.slice(1, 3));
+            let data_type = column.data_type();
+            assert_eq!(
+                ArrowDigester::hash_array_chunks(
+                    data_type,
+                    &[left.as_ref(), right.as_ref()],
+                    config()
+                ),
+                ArrowDigester::hash_array_with_config(column.as_ref(), config())
+            );
+            let empty = column.slice(0, 0);
+            assert_eq!(
+                ArrowDigester::hash_array_chunks(data_type, &[], config()),
+                ArrowDigester::hash_array_with_config(empty.as_ref(), config())
+            );
+        }
+        let ints = Int32Array::from(vec![1]);
+        assert_eq!(
+            ArrowDigester::try_hash_array_chunks(&DataType::Int64, &[&ints], config()),
+            Err(StarfixError::ChunkTypeMismatch(DataType::Int32))
+        );
+    }
 }

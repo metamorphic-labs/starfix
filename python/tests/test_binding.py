@@ -110,6 +110,23 @@ def test_a_chunked_array_hashes_as_its_chunks_combined():
     assert ArrowDigester.hash_array(pa.chunked_array([], pa.int8())) == ArrowDigester.hash_array(pa.array([], pa.int8()))
 
 
+def test_a_chunked_dictionary_whose_chunks_do_not_combine_hashes():
+    # Two valid dictionary<int8, string> chunks of 100 values each: their combined dictionary
+    # would need 200 entries, more than int8 keys index (combine_chunks raises). The chunks are
+    # hashed one after the other, as their decoded concatenation.
+    def chunk(start):
+        values = [f"v{i}" for i in range(start, start + 100)]
+        return pa.DictionaryArray.from_arrays(pa.array(range(100), pa.int8()), pa.array(values))
+
+    chunked = pa.chunked_array([chunk(0), chunk(100)])
+    with pytest.raises(pa.ArrowException):
+        chunked.combine_chunks()
+    decoded = pa.array([f"v{i}" for i in range(200)])
+    assert ArrowDigester.hash_array(chunked) == ArrowDigester.hash_array(decoded)
+    table = pa.table({"d": chunked})
+    assert ArrowDigester.hash_table(table) == ArrowDigester.hash_table(pa.table({"d": decoded}))
+
+
 @pytest.mark.parametrize(
     "v",
     [v for v in VECTORS if v["method"] in ("hash_record_batch", "hash_stream", "hash_array")],

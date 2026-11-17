@@ -74,17 +74,6 @@ def _batches_of(table: pa.Table) -> list[pa.RecordBatch]:
     return batches
 
 
-def _combined(chunked: pa.ChunkedArray) -> pa.Array:
-    """A ChunkedArray as one array: its hash is that of its chunks combined."""
-    if chunked.num_chunks == 1:
-        return chunked.chunk(0)
-    try:
-        return chunked.combine_chunks()
-    except pa.ArrowNotImplementedError as e:
-        # pyarrow cannot concatenate some types whose data the format does not hash either.
-        raise ValueError(f"Hashing data of type {chunked.type} is not supported: {e}") from e
-
-
 class ArrowDigester:
     """Hash Arrow schemas, record batches, tables and arrays (hash format 2).
 
@@ -242,9 +231,10 @@ class ArrowDigester:
         """
         _require_little_endian()
         _require(array, (pa.Array, pa.ChunkedArray), "hash_array", "a pyarrow.Array or pyarrow.ChunkedArray")
-        if isinstance(array, pa.ChunkedArray):
-            array = _combined(array)
-        return _internal.hash_array(_array(array), bool(ordered_columns), bool(ordered_struct_fields))
+        chunks = array.chunks if isinstance(array, pa.ChunkedArray) else [array]
+        return _internal.hash_array(
+            array.type, [_array(chunk) for chunk in chunks], bool(ordered_columns), bool(ordered_struct_fields)
+        )
 
 
 class PreparedSchema:

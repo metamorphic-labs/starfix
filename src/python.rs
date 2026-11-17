@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::{ptr, slice};
 
 use arrow::array::{
-    make_array, ArrayData, ArrayDataBuilder, RecordBatch, RecordBatchOptions, StructArray,
+    make_array, Array, ArrayData, ArrayDataBuilder, RecordBatch, RecordBatchOptions, StructArray,
 };
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::pyarrow::{FromPyArrow as _, ToPyArrow as _};
@@ -507,18 +507,25 @@ fn hash_table<'py>(
     Ok(digester.finalize(py))
 }
 
-/// `ArrowDigester.hash_array` of one array (the Python layer combines a `ChunkedArray`).
+/// `ArrowDigester.hash_array`: the chunks of a `ChunkedArray` (or one array), all of type
+/// `py_type`, hashed as their concatenation without concatenating them.
 #[pyfunction]
 fn hash_array<'py>(
     py: Python<'py>,
-    py_array: &Bound<'py, PyAny>,
+    py_type: &Bound<'py, PyAny>,
+    py_chunks: &Bound<'py, PyAny>,
     ordered_columns: bool,
     ordered_struct_fields: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let array = make_array(import_array(py_array)?);
+    let data_type = DataType::from_pyarrow_bound(py_type)?;
+    let chunks = py_chunks
+        .try_iter()?
+        .map(|chunk| Ok(make_array(import_array(&chunk?)?)))
+        .collect::<PyResult<Vec<_>>>()?;
     let config = config(false, ordered_columns, ordered_struct_fields);
     let digest = hashing(py, || {
-        ArrowDigester::try_hash_array_with_config(array.as_ref(), config)
+        let chunk_refs: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
+        ArrowDigester::try_hash_array_chunks(&data_type, &chunk_refs, config)
     })?;
     Ok(bytes(py, &digest))
 }

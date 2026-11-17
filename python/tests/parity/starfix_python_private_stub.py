@@ -74,6 +74,15 @@ EXCLUDED = {
         "counts calls of starfix-python's private analysis functions; the crate's one-shot "
         "calls analyse the schema once by construction (ITL-1177)"
     ),
+    "test_prepared_schema.py::test_prepared_hashes_of_an_identical_schema_do_not_analyse": (
+        "counts calls of starfix-python's private analysis functions; the crate's prepared "
+        "calls accept an identical or equal schema by pointer or structural comparison, without "
+        "analysis (tests/prepared_schema.rs, ITL-1177)"
+    ),
+    "test_prepared_schema.py::test_streaming_update_of_an_identical_schema_does_not_analyse": (
+        "counts calls of starfix-python's private analysis functions; the crate's streaming "
+        "update accepts an equal schema by structural comparison, without analysis (ITL-1177)"
+    ),
 }
 
 

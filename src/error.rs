@@ -38,8 +38,11 @@ pub enum StarfixError {
         /// The node path of the field (byte-layout spec Section 3.1).
         path: String,
     },
-    /// The total row count of a stream does not fit in a `u64`.
+    /// The total row count of a stream (or length of an array's chunks) does not fit in a `u64`.
     RowCountOverflow,
+    /// A chunk passed to `hash_array_chunks` whose type is not the declared one. Holds the
+    /// chunk's type.
+    ChunkTypeMismatch(DataType),
 }
 
 impl fmt::Display for StarfixError {
@@ -70,6 +73,10 @@ impl fmt::Display for StarfixError {
                 f.write_str("A non-nullable field contains null values")
             }
             Self::RowCountOverflow => f.write_str("row count overflow"),
+            Self::ChunkTypeMismatch(data_type) => write!(
+                f,
+                "a chunk of type {data_type} differs from the declared type of the chunks"
+            ),
         }
     }
 }
