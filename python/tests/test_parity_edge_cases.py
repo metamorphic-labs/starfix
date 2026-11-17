@@ -244,11 +244,13 @@ def _hashes(schema: pa.Schema, batch: pa.RecordBatch, options: dict) -> dict[str
 
     prepared = ArrowDigester.prepare(schema, **options)
 
+    table = pa.Table.from_batches([batch, batch])
+
     def streamed(digester):
-        digester.update(batch)
+        for each in table.to_batches():
+            digester.update(each)
         return digester.finalize()
 
-    table = pa.Table.from_batches([batch, batch])
     array_options = {k: v for k, v in options.items() if k != "include_metadata"}
     return {
         "hash_schema": outcome(lambda: ArrowDigester.hash_schema(schema, **options)),
