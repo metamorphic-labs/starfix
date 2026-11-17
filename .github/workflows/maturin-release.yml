@@ -50,8 +50,10 @@ jobs:
         run: |
           rustup target add ${{ matrix.target }}
           python -m venv .venv-build
-          .venv-build/bin/pip install "maturin[zig]>=1.9.6,<2"
-          .venv-build/bin/maturin build --release --out dist --zig \
+          # maturin finds zig (the ziglang package) through the active Python.
+          source .venv-build/bin/activate
+          pip install "maturin[zig]>=1.9.6,<2"
+          maturin build --release --out dist --zig \
             --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }}
       - name: Test the wheel in a clean environment
         if: matrix.test

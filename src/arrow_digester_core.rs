@@ -145,6 +145,39 @@ fn logical_type(data_type: &DataType) -> &DataType {
     }
 }
 
+/// The entries of a digester being updated, restored to their state before the update when
+/// dropped without `keep` (a refusal returned, or a panic unwinding).
+struct RestoreUnlessKept<'a, D: Digest + Clone> {
+    entries: &'a mut BTreeMap<String, DigestBufferType<D>>,
+    saved: Option<Vec<EntryState<D>>>,
+}
+
+impl<'a, D: Digest + Clone> RestoreUnlessKept<'a, D> {
+    fn new(entries: &'a mut BTreeMap<String, DigestBufferType<D>>) -> Self {
+        let saved = Some(entries.values().map(EntryState::of).collect());
+        Self { entries, saved }
+    }
+
+    const fn entries(&mut self) -> &mut BTreeMap<String, DigestBufferType<D>> {
+        self.entries
+    }
+
+    /// The update succeeded: keep the new state.
+    fn keep(mut self) {
+        self.saved = None;
+    }
+}
+
+impl<D: Digest + Clone> Drop for RestoreUnlessKept<'_, D> {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            for (entry, state) in self.entries.values_mut().zip(saved) {
+                state.restore(entry);
+            }
+        }
+    }
+}
+
 /// Recursively normalize a `DataType` to its canonical large equivalent.
 ///
 /// - `Utf8` → `LargeUtf8`
@@ -405,24 +438,23 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
 
     /// `update` for a batch whose schema the caller has already matched against the analysis.
     /// A refused batch leaves the digester as it was: the digests and validity lengths are
-    /// saved first (per node, not per row) and restored on a refusal.
+    /// saved first (per node, not per row) and restored on a refusal, and also when hashing the
+    /// batch panics (arrow-rs on invalid Arrow data), so a caught panic leaves no half-updated
+    /// digester either.
     ///
     /// # Errors
     /// When a non-nullable field holds a null that no enclosing null struct masks, or the row
     /// count overflows.
     pub fn try_update_matched(&mut self, record_batch: &RecordBatch) -> Result<(), StarfixError> {
-        let saved: Vec<EntryState<D>> = self
-            .fields_digest_buffer
-            .values()
-            .map(EntryState::of)
-            .collect();
-        let result = self.ingest(record_batch);
-        if result.is_err() {
-            for (entry, state) in self.fields_digest_buffer.values_mut().zip(saved) {
-                state.restore(entry);
-            }
-        }
-        result
+        let row_count = self
+            .row_count
+            .checked_add(record_batch.num_rows() as u64)
+            .ok_or(StarfixError::RowCountOverflow)?;
+        let mut guard = RestoreUnlessKept::new(&mut self.fields_digest_buffer);
+        Self::ingest_into(record_batch, guard.entries())?;
+        guard.keep();
+        self.row_count = row_count;
+        Ok(())
     }
 
     /// Add a batch whose schema is known to match, without saving the digester's state: on a
@@ -435,7 +467,16 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             .row_count
             .checked_add(record_batch.num_rows() as u64)
             .ok_or(StarfixError::RowCountOverflow)?;
+        Self::ingest_into(record_batch, &mut self.fields_digest_buffer)?;
+        self.row_count = row_count;
+        Ok(())
+    }
 
+    /// Traverse every column of a batch into the entries.
+    fn ingest_into(
+        record_batch: &RecordBatch,
+        entries: &mut BTreeMap<String, DigestBufferType<D>>,
+    ) -> Result<(), StarfixError> {
         let schema = record_batch.schema_ref();
         for col_idx in 0..record_batch.num_columns() {
             let field = schema.field(col_idx);
@@ -448,10 +489,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 array.as_ref(),
                 &path,
                 None, // no ancestor struct nulls at top level
-                &mut self.fields_digest_buffer,
+                entries,
             )?;
         }
-        self.row_count = row_count;
         Ok(())
     }
 

@@ -134,3 +134,59 @@ def _random_table(rng: random.Random) -> pa.Table:
         columns.append(pa.array(values, type=t))
     schema = pa.schema(fields, metadata=_random_metadata(rng))
     return pa.Table.from_arrays(columns, schema=schema)
+
+
+# --- dictionary chunks beyond the index capacity (ITL-1178) --------------------------------
+
+
+def dictionary_chunks(index: pa.DataType, size: int, offset: int, rng: random.Random | None = None):
+    """Two valid dictionary chunks of `index` type, `size` values each, the second's values
+    starting at `offset` (disjoint when offset == size); together beyond the index capacity
+    when size + offset is. Every seventh row (or random rows with `rng`) is null. Returns the
+    encoded chunks and the same chunks decoded."""
+    encoded, decoded = [], []
+    for first, extra in ((0, 3), (offset, 5)):
+        count = size + extra
+        nulls = [(rng.random() < 0.15) if rng else (i % 7 == 3) for i in range(count)]
+        keys = pa.array([None if nulls[i] else i % size for i in range(count)], type=index)
+        values = pa.array([f"v{first + j}" for j in range(size)])
+        encoded.append(pa.DictionaryArray.from_arrays(keys, values))
+        decoded.append(pa.array([None if nulls[i] else f"v{first + i % size}" for i in range(count)]))
+    return encoded, decoded
+
+
+def wrap_chunks(chunks, kind: str):
+    """The chunks as they are ("top"), each inside a nullable struct, or inside a list."""
+    if kind == "top":
+        return list(chunks)
+    out = []
+    for chunk in chunks:
+        n = len(chunk)
+        if kind == "struct":
+            mask = pa.array([i % 5 == 1 for i in range(n)])
+            out.append(pa.StructArray.from_arrays([chunk], names=["x"], mask=mask))
+        else:  # list: lists of 2, 0 and 1 items over the chunk, in order
+            offsets, used, k = [0], 0, 0
+            while used < n:
+                used += min([2, 0, 1][k % 3], n - used)
+                offsets.append(used)
+                k += 1
+            out.append(pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), chunk))
+    return out
+
+
+def dictionary_table(seed: int) -> pa.Table:
+    """A seeded table of two record batches whose dictionary column (top level, in a struct or
+    in a list; int8, uint8 or int16 indices; disjoint or overlapping dictionaries; nulls) has a
+    combined dictionary beyond its index capacity, next to a plain column."""
+    rng = random.Random(seed)
+    index, capacity = rng.choice([(pa.int8(), 128), (pa.uint8(), 256), (pa.int16(), 32_768)])
+    size = rng.randint(capacity // 2 + 1, capacity - 1)
+    offset = rng.choice([size, rng.randint(capacity - size + 1, size)])  # disjoint or overlapping
+    encoded, _ = dictionary_chunks(index, size, offset, rng)
+    kind = rng.choice(["top", "struct", "list"])
+    batches = [
+        pa.RecordBatch.from_arrays([c, pa.array(range(len(c)), pa.int64())], names=["d", "n"])
+        for c in wrap_chunks(encoded, kind)
+    ]
+    return pa.Table.from_batches(batches)

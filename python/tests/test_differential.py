@@ -24,7 +24,7 @@ import pyarrow as pa
 import pytest
 
 import starfix
-from _support import OPTION_SETS, golden_vectors, random_table, read_ipc, rechunk
+from _support import OPTION_SETS, dictionary_table, golden_vectors, random_table, read_ipc, rechunk
 
 RANDOM_SEEDS = range(int(os.environ.get("STARFIX_DIFFERENTIAL_SEEDS", "150")))
 WORKER = Path(__file__).with_name("starfix_python_worker.py")
@@ -67,6 +67,8 @@ def _cases():
         yield f"golden:{v['id']}", rechunk(pa.Table.from_batches(batches, schema=schema), random.Random(v["id"]))
     for seed in RANDOM_SEEDS:
         yield f"random:{seed}", random_table(seed)
+    for seed in range(int(os.environ.get("STARFIX_DIFFERENTIAL_DICTIONARY_SEEDS", "12"))):
+        yield f"dictionary:{seed}", dictionary_table(seed)
     # pyarrow's invalid array of a null struct over a dictionary child (an out-of-range key
     # that is never read): both implementations must hash it alike.
     hidden = pa.array([None, None], type=pa.struct([("x", pa.dictionary(pa.int32(), pa.string()))]))
