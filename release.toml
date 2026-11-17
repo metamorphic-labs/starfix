@@ -1,4 +1,4 @@
-# cargo-release configuration for nauticalab/starfix.
+# cargo-release configuration for metamorphic-labs/starfix.
 #
 # Usage:
 #   cargo release <version> --execute --no-confirm
@@ -12,8 +12,8 @@
 # short-lived token and passes it as CARGO_REGISTRY_TOKEN to cargo-release,
 # satisfying its pre-publish token check so publish = true works.
 #
-# The Python package "starfix" is a separate project released exclusively
-# through nauticalab/starfix-python.
+# Who releases, and the GitHub environments the publishing jobs need:
+# RELEASING.md.
 pre-release-commit-message = "chore: release v{{version}}"
 tag-name                   = "v{{version}}"
 push                       = true

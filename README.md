@@ -11,7 +11,7 @@ hashes, up to SHA-256 collisions (tested exhaustively on small inputs of every s
 Every hash is 35 bytes: a 3-byte **hash format version** followed by a SHA-256 digest. This crate
 produces **hash format 2** (`00 00 02`). The exact bytes are specified in
 [`docs/byte-layout-spec.md`](docs/byte-layout-spec.md), precisely enough for an independent
-implementation. [starfix-python](https://github.com/nauticalab/starfix-python) is being updated
+implementation. [starfix-python](https://github.com/metamorphic-labs/starfix-python) is being updated
 to format 2 in a companion change (its released versions produce format 1); its format-2
 implementation must match the Rust-generated golden vectors in `tests/golden/format2_v0.5.json`
 exactly.
