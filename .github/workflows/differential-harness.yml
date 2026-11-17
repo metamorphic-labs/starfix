@@ -1,5 +1,6 @@
 # The seeded differential harness (python/tests/test_harness.py; ITL-1178): the Python package
-# built from this crate against starfix-python 0.5.0 from PyPI (hash-pinned), on seeded tables
+# built from this crate against a reference starfix-python from PyPI (hash-pinned; 0.5.0 by
+# default, the version is an input), on seeded tables
 # built in each process (_harness.py). Every call must give the same digest on both sides, or
 # raise on both sides in the same class; a crash always fails.
 #
@@ -20,6 +21,14 @@ on:
         description: 'The shards to run, as a JSON list (for example "[0, 1, 2, 3]")'
         type: string
         required: true
+      reference:
+        description: The starfix-python version to compare with (its differences are recorded per version)
+        type: string
+        default: '0.5.0'
+      reference_requirements:
+        description: The hash-pinned requirements file that installs that version
+        type: string
+        default: python/tests/starfix-python-requirements.txt
   workflow_dispatch:
     inputs:
       seeds:
@@ -30,6 +39,14 @@ on:
         description: 'The shards to run, as a JSON list'
         type: string
         default: '[0, 1, 2, 3]'
+      reference:
+        description: The starfix-python version to compare with
+        type: string
+        default: '0.5.0'
+      reference_requirements:
+        description: The hash-pinned requirements file that installs that version
+        type: string
+        default: python/tests/starfix-python-requirements.txt
   schedule:
     - cron: '23 5 * * *'  # nightly: the release tier
 
@@ -77,7 +94,7 @@ jobs:
         with:
           name: harness-wheel
           path: dist
-      - name: Install the wheel, and starfix-python 0.5.0 with the same pyarrow in its own environment
+      - name: Install the wheel, and the reference starfix-python with the same pyarrow in its own environment
         run: |
           python -m venv .venv-starfix
           .venv-starfix/bin/pip install dist/*.whl pytest
@@ -87,11 +104,12 @@ jobs:
           PYARROW=$(.venv-starfix/bin/python -c "import pyarrow; print(pyarrow.__version__)")
           python -m venv .venv-starfix-python
           .venv-starfix-python/bin/pip install "pyarrow==${PYARROW}"
-          .venv-starfix-python/bin/pip install --no-deps --require-hashes -r python/tests/starfix-python-requirements.txt
+          .venv-starfix-python/bin/pip install --no-deps --require-hashes -r "${{ inputs.reference_requirements || 'python/tests/starfix-python-requirements.txt' }}"
       - name: The harness, this shard's seeds
         env:
           STARFIX_PYTHON: ${{ github.workspace }}/.venv-starfix-python/bin/python
           STARFIX_REQUIRE_DIFFERENTIAL: '1'
+          STARFIX_REFERENCE_VERSION: ${{ inputs.reference || '0.5.0' }}
           SEEDS: ${{ inputs.seeds || 50000 }}
           SHARDS: ${{ inputs.shards || '[0, 1, 2, 3]' }}
           SHARD: ${{ matrix.shard }}

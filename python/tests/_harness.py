@@ -326,15 +326,18 @@ def build_case(seed: int) -> Case:
 # --- expected differences (named, with the reason; listed in the pull request) ------------
 
 
+# The reference implementation is a parameter: starfix-python 0.5.0 today (0.5.1 later, with
+# the pyarrow take() fix of ITL-1223). Each expected difference is recorded per reference.
+DEFAULT_REFERENCE = "0.5.0"
+
+
 @dataclass
 class ExpectedDifference:
-    """An input on which the binding hashes the `differing` calls where starfix-python 0.5.0
-    raises `theirs` (a class of `classify`), or, with `theirs` "other-digest", gives another
-    digest; every other call gives equal digests. A change on either side fails
-    `test_harness`."""
+    """On a named case, the binding hashes the `differing` calls where the reference raises
+    `theirs` (a class of `classify`), or, with `theirs` "other-digest", gives another digest;
+    every other call gives equal digests. A change on either side fails `test_harness`."""
 
     reason: str
-    build: object  # () -> Case
     theirs: str
     differing: frozenset  # call names without the [index]
 
@@ -346,7 +349,7 @@ def _empty_array_of_an_invalid_dictionary() -> Case:
     values = pa.ExtensionArray.from_storage(HarnessExtension(inner_type), inner)
     column = pa.DictionaryArray.from_arrays(pa.array([], pa.int16()), values)
     batch = pa.RecordBatch.from_arrays([column], names=["d"])
-    return Case(-1, batch.schema, [batch], {"expected-difference"})
+    return Case(-1, batch.schema, [batch], {"named-case"})
 
 
 def _dictionary_over_a_sliced_nested_fixed_size_list() -> Case:
@@ -355,49 +358,68 @@ def _dictionary_over_a_sliced_nested_fixed_size_list() -> Case:
     # Key 0 only: pyarrow's wrong take then reads row 2, inside the array (deterministic).
     column = pa.DictionaryArray.from_arrays(pa.array([0], pa.int8()), values)
     batch = pa.RecordBatch.from_arrays([column], names=["d"])
-    return Case(-3, batch.schema, [batch], {"expected-difference"})
+    return Case(-3, batch.schema, [batch], {"named-case"})
 
 
 def _empty_dictionary_without_offsets_buffer() -> Case:
     dictionary = bufferless_empty(pa.string())
     column = pa.DictionaryArray.from_arrays(pa.array([None, None], pa.int32()), dictionary)
     batch = pa.RecordBatch.from_arrays([column], names=["d"])
-    return Case(-2, batch.schema, [batch], {"expected-difference"})
+    return Case(-2, batch.schema, [batch], {"named-case"})
 
+
+# Hand-built cases run on every harness run; a reference without a recorded difference for
+# one must agree on it completely.
+NAMED_CASES = {
+    "empty-array-of-an-invalid-dictionary": _empty_array_of_an_invalid_dictionary,
+    "dictionary-over-a-sliced-nested-fixed-size-list": _dictionary_over_a_sliced_nested_fixed_size_list,
+    "empty-dictionary-without-offsets-buffer": _empty_dictionary_without_offsets_buffer,
+}
 
 EXPECTED_DIFFERENCES = {
-    "empty-array-of-an-invalid-dictionary": ExpectedDifference(
-        "Zero rows of a dictionary whose dictionary is invalid (an inner out-of-range key): the "
-        "binding reads no row and hashes the empty array; 0.5.0 decodes the dictionary and raises "
-        "ArrowIndexError in a stream, hash_record_batch and hash_array, while its own hash_table "
-        "gives the binding's digest. The input is invalid Arrow (validate(full=True) fails).",
-        _empty_array_of_an_invalid_dictionary,
-        "invalid-data",
-        frozenset({"stream", "hash_record_batch", "hash_array"}),
-    ),
-    "dictionary-over-a-sliced-nested-fixed-size-list": ExpectedDifference(
-        "pyarrow >= 17 take() (and filter()) returns wrong values for a sliced "
-        "fixed_size_list<fixed_size_list<...>>[n >= 2]; 0.5.0 decodes a dictionary of nested "
-        "values with take, so it hashes other values than the input's. The binding hashes the "
-        "input's values (equal to the same values built fresh, where both agree). Pending the "
-        "developer's decision (keep, option A).",
-        _dictionary_over_a_sliced_nested_fixed_size_list,
-        "other-digest",
-        frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
-    ),
-    "empty-dictionary-without-offsets-buffer": ExpectedDifference(
-        "A dictionary whose empty dictionary has no offsets buffer (valid Arrow; every key null): "
-        "the binding hashes it as with an allocated buffer; 0.5.0 fails with TypeError "
-        "(memoryview of None).",
-        _empty_dictionary_without_offsets_buffer,
-        "type",
-        frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
-    ),
+    "0.5.0": {
+        "empty-array-of-an-invalid-dictionary": ExpectedDifference(
+            "Zero rows of a dictionary whose dictionary is invalid (an inner out-of-range key): "
+            "the binding reads no row and hashes the empty array; 0.5.0 decodes the dictionary "
+            "and raises ArrowIndexError in a stream, hash_record_batch and hash_array, while its "
+            "own hash_table gives the binding's digest. The input is invalid Arrow.",
+            "invalid-data",
+            frozenset({"stream", "hash_record_batch", "hash_array"}),
+        ),
+        "dictionary-over-a-sliced-nested-fixed-size-list": ExpectedDifference(
+            "0.5.0 is wrong here (pyarrow take), fixed in 0.5.1: ITL-1223. pyarrow >= 17 take() "
+            "and filter() return wrong values for a sliced fixed_size_list<fixed_size_list<...>> "
+            "of outer size >= 2; 0.5.0 decodes a dictionary of nested values with take, so it "
+            "hashes other values than the input's. The binding hashes the input's values "
+            "(developer's decision, Nov 17).",
+            "other-digest",
+            frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
+        ),
+        "empty-dictionary-without-offsets-buffer": ExpectedDifference(
+            "A dictionary whose empty dictionary has no offsets buffer (valid Arrow; every key "
+            "null): the binding hashes it as with an allocated buffer; 0.5.0 fails with "
+            "TypeError (memoryview of None).",
+            "type",
+            frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
+        ),
+    },
+}
+
+# Seeds of the generator (this GENERATOR_VERSION) whose recorded calls differ, per reference,
+# for a named reason; their other calls are compared as usual.
+EXPECTED_SEED_DIFFERENCES = {
+    "0.5.0": {
+        27714: (
+            "dictionary-over-a-sliced-nested-fixed-size-list",
+            "other-digest",
+            frozenset({"hash_table", "stream", "hash_record_batch[1]", "hash_array[1]"}),
+        ),
+    },
 }
 
 
 def _differs_as(ours: list, theirs: list, kind: str) -> bool:
-    """The binding hashes; 0.5.0 raises `kind`, or ("other-digest") gives another digest."""
+    """The binding hashes; the reference raises `kind`, or ("other-digest") gives another digest."""
     if ours[0] != "digest":
         return False
     if kind == "other-digest":
@@ -405,39 +427,32 @@ def _differs_as(ours: list, theirs: list, kind: str) -> bool:
     return theirs[0] == "raise" and theirs[1] == kind
 
 
-# Seeds of the generator (this GENERATOR_VERSION) whose recorded calls differ for a named
-# reason; their other calls are compared as usual.
-EXPECTED_SEED_DIFFERENCES = {
-    27714: (
-        "dictionary-over-a-sliced-nested-fixed-size-list",
-        "other-digest",
-        frozenset({"hash_table", "stream", "hash_record_batch[1]", "hash_array[1]"}),
-    ),
-}
-
-
-def seed_difference_holds(seed: int, key: str, call: str, ours: list, theirs: list) -> bool | None:
+def seed_difference_holds(reference: str, seed: int, call: str, ours: list, theirs: list) -> bool | None:
     """For an allowlisted seed's recorded call: whether it still differs as recorded; None for
     any other call (compared as usual)."""
-    if seed not in EXPECTED_SEED_DIFFERENCES:
+    recorded = EXPECTED_SEED_DIFFERENCES.get(reference, {}).get(seed)
+    if recorded is None:
         return None
-    _, kind, calls = EXPECTED_SEED_DIFFERENCES[seed]
+    _, kind, calls = recorded
     return _differs_as(ours, theirs, kind) if call in calls else None
 
 
-def expected_difference_holds(name: str, ours: dict, theirs: dict) -> list[str]:
-    """The calls of a named case that do not differ as recorded (empty when all do)."""
-    expected = EXPECTED_DIFFERENCES[name]
+def named_case_holds(reference: str, name: str, ours: dict, theirs: dict) -> list[str]:
+    """The calls of a named case that do not behave as recorded for `reference` (empty when all
+    do): its recorded difference, or full agreement when none is recorded."""
+    expected = EXPECTED_DIFFERENCES.get(reference, {}).get(name)
     wrong = []
     for key, calls in ours.items():
         for call, outcome in calls.items():
             other = theirs[key][call]
-            if call.split("[")[0] in expected.differing:
+            if expected is not None and call.split("[")[0] in expected.differing:
                 holds = _differs_as(outcome, other, expected.theirs)
-            else:
+            elif expected is not None:
                 holds = outcome == other and outcome[0] == "digest"
+            else:
+                holds = same_outcome(outcome, other)
             if not holds:
-                wrong.append(f"{name} {key} {call}: ours {outcome} / starfix-python {other}")
+                wrong.append(f"{name} {key} {call}: ours {outcome} / reference {other}")
     return wrong
 
 

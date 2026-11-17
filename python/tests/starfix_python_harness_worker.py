@@ -28,8 +28,8 @@ def main(manifest_path, results_path):
         for seed in range(start, start + count)
     }
     named = {
-        name: _harness.outcomes(starfix.ArrowDigester, difference.build(), manifest["option_sets"])
-        for name, difference in _harness.EXPECTED_DIFFERENCES.items()
+        name: _harness.outcomes(starfix.ArrowDigester, build(), manifest["option_sets"])
+        for name, build in _harness.NAMED_CASES.items()
     }
     with open(results_path, "w") as f:
         json.dump(
@@ -37,7 +37,7 @@ def main(manifest_path, results_path):
                 "starfix_version": version("starfix"),
                 "generator_version": _harness.GENERATOR_VERSION,
                 "results": results,
-                "expected_differences": named,
+                "named_cases": named,
             },
             f,
         )

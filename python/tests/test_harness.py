@@ -12,7 +12,8 @@ its refusals may come first); a crash never matches.
 pull request and 50,000, in shards, before a release. Skipped when ``STARFIX_PYTHON`` is unset,
 unless ``STARFIX_REQUIRE_DIFFERENTIAL`` is set, where it fails instead.
 
-Named differences are expected (``_harness.EXPECTED_DIFFERENCES``, with the reasons:
+The reference is ``STARFIX_REFERENCE_VERSION`` (default 0.5.0). Named differences are expected
+per reference (``_harness.EXPECTED_DIFFERENCES``, with the reasons:
 unusual dictionaries where the binding hashes and 0.5.0 raises, and a pyarrow >= 17 take()
 bug that makes 0.5.0 hash other values than the input's), as are the recorded calls of
 allowlisted seeds (``EXPECTED_SEED_DIFFERENCES``). Both are checked to differ exactly as
@@ -30,20 +31,23 @@ from pathlib import Path
 import pyarrow as pa
 
 from _harness import (
+    DEFAULT_REFERENCE,
     DEFECTS,
-    EXPECTED_DIFFERENCES,
     GENERATOR_VERSION,
+    NAMED_CASES,
     build_case,
-    expected_difference_holds,
+    named_case_holds,
     outcomes,
-    seed_difference_holds,
     same_outcome,
+    seed_difference_holds,
 )
 from _support import OPTION_SETS
 from starfix import ArrowDigester
-from test_differential import STARFIX_PYTHON_VERSION, _starfix_python
+from test_differential import _starfix_python
 
 WORKER = Path(__file__).with_name("starfix_python_harness_worker.py")
+# The starfix-python version in STARFIX_PYTHON's environment (0.5.0 today; 0.5.1 later).
+REFERENCE = os.environ.get("STARFIX_REFERENCE_VERSION", DEFAULT_REFERENCE)
 
 
 def _seeds() -> tuple[int, int]:
@@ -64,7 +68,7 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
     results_path = tmp_path / "results.json"
     subprocess.run([interpreter, "-I", str(WORKER), str(manifest), str(results_path)], check=True)
     worker = json.loads(results_path.read_text())
-    assert worker["starfix_version"] == STARFIX_PYTHON_VERSION, "the worker must run starfix-python 0.5.0"
+    assert worker["starfix_version"] == REFERENCE, f"the worker must run starfix-python {REFERENCE}"
     assert worker["generator_version"] == GENERATOR_VERSION
     assert pa.__version__, "both environments install the same pyarrow (CI pins it)"
 
@@ -77,7 +81,7 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
             for call, ours in calls.items():
                 other = theirs[key][call]
                 counts["digest" if ours[0] == "digest" else f"raise:{ours[1]}"] += 1
-                recorded = seed_difference_holds(seed, key, call, ours, other)
+                recorded = seed_difference_holds(REFERENCE, seed, call, ours, other)
                 if recorded is not None:
                     counts["expected difference"] += 1
                     if not recorded:
@@ -93,9 +97,10 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
         + "\n".join(_report(f) for f in failures[:15])
     )
     assert counts["digest"] > sum(counts.values()) // 3, f"most calls must hash, not raise: {summary}"
-    # The named, expected differences (listed in the pull request) are exactly as recorded.
+    # The named cases behave exactly as recorded for this reference (listed in the pull request).
     wrong = []
-    for name, difference in EXPECTED_DIFFERENCES.items():
-        ours = outcomes(ArrowDigester, difference.build(), OPTION_SETS)
-        wrong += expected_difference_holds(name, ours, worker["expected_differences"][name])
-    assert not wrong, "an expected difference changed:\n" + "\n".join(wrong[:10])
+    for name, build in NAMED_CASES.items():
+        wrong += named_case_holds(
+            REFERENCE, name, outcomes(ArrowDigester, build(), OPTION_SETS), worker["named_cases"][name]
+        )
+    assert not wrong, f"a named case differs from its record for starfix-python {REFERENCE}:\n" + "\n".join(wrong[:10])
