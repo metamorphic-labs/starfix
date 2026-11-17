@@ -3,7 +3,7 @@
 The interface is starfix-python's (``ArrowDigester``, ``PreparedSchema``): same names,
 signatures, defaults, results and exception types. Every hash is 35 bytes: the 3-byte format
 number ``00 00 02`` followed by a SHA-256 digest (``docs/byte-layout-spec.md`` in
-nauticalab/starfix).
+metamorphic-labs/starfix).
 """
 
 from __future__ import annotations
@@ -65,13 +65,59 @@ def _array(array: pa.Array) -> pa.Array:
 
 
 def _batches_of(table: pa.Table) -> list[pa.RecordBatch]:
-    """Every record batch of a table; one empty batch of its schema when it has none (so an
-    empty table hashes as a zero-row batch, and its schema is still checked)."""
-    batches = [_batch(batch) for batch in table.to_batches()]
-    if not batches:
-        empty = _empty_batch(table.schema)
-        batches = [] if empty is None else [empty]
-    return batches
+    """Every record batch of a table (none for an empty table: the native module hashes it as
+    one empty batch of the table's schema, which a prepared schema checks)."""
+    return [_batch(batch) for batch in table.to_batches()]
+
+
+_EXTENSION_KEYS = (b"ARROW:extension:name", b"ARROW:extension:metadata")
+
+
+def _logical(t: pa.DataType) -> pa.DataType:
+    """Extension -> storage type, dictionary -> value type, repeatedly."""
+    while True:
+        if isinstance(t, pa.BaseExtensionType):
+            t = t.storage_type
+        elif pa.types.is_dictionary(t):
+            t = t.value_type
+        else:
+            return t
+
+
+def _child_nodes(t: pa.DataType, path: str) -> list[tuple[str, pa.Field]]:
+    """The child nodes of a node of type `t`, as (node path, field) (spec Section 3.1)."""
+    t = _logical(t)
+    if pa.types.is_struct(t):
+        return [(f"{path}/{t.field(i).name}", t.field(i)) for i in range(t.num_fields)]
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+        return [(path + "/", t.value_field)]
+    if pa.types.is_map(t):
+        return [(path + "//key", t.key_field), (path + "//value", t.item_field)]
+    return []
+
+
+def _check_extension_metadata(schema: pa.Schema) -> None:
+    """Refuse explicit ``ARROW:extension:*`` field metadata that differs from what the field's
+    registered extension type exports (spec Section 7 with ``include_metadata``, as
+    starfix-python). pyarrow's export lets the explicit value replace the type's, so only the
+    pyarrow fields show the conflict; the native module calls this when the exported schema
+    carries an extension name."""
+    stack = [(schema.field(i).name, schema.field(i)) for i in reversed(range(len(schema)))]
+    while stack:
+        path, field = stack.pop()
+        t = field.type
+        while pa.types.is_dictionary(t):  # a dictionary of an extension type keeps its keys
+            t = t.value_type
+        explicit = field.metadata
+        if explicit and isinstance(t, pa.BaseExtensionType):
+            own = zip(_EXTENSION_KEYS, _internal.extension_metadata(pa.field("x", t)))
+            for key, value in own:
+                if key in explicit and explicit[key] != value:
+                    raise ValueError(
+                        f"Field {path!r}: {key.decode()}={explicit[key].decode()!r} is set, conflicting with its "
+                        f"extension type ({value.decode()!r}): ambiguous, rejected with include_metadata"
+                    )
+        stack.extend(reversed(_child_nodes(field.type, path)))
 
 
 class ArrowDigester:
@@ -88,8 +134,9 @@ class ArrowDigester:
     Null, Map, Interval or view types (their schemas hash; also inside a FixedSizeList),
     whatever the number of rows; a non-nullable field holding a null that no enclosing
     struct null explains; duplicate metadata keys when ``include_metadata`` is on; a streamed
-    batch whose schema differs from the digester's; and invalid Arrow data. Raises
-    ``TypeError`` for a wrong container type (for example a Table passed to
+    batch whose schema differs from the digester's; explicit ``ARROW:extension:*`` field
+    metadata conflicting with the field's registered extension type when ``include_metadata`` is
+    on; and invalid Arrow data. Raises ``TypeError`` for a wrong container type (for example a Table passed to
     ``hash_record_batch``).
 
     A digester is not thread-safe: feed one digester from one thread at a time. A batch
@@ -323,7 +370,7 @@ class PreparedSchema:
     def hash_table(self, table: pa.Table) -> bytes:
         """Hash a table of this schema (see the same-schema rule)."""
         _require(table, pa.Table, "hash_table", _TABLE_TYPE)
-        return self._prepared.hash_table(_batches_of(table))
+        return self._prepared.hash_table(table.schema, _batches_of(table))
 
     def digester(self) -> ArrowDigester:
         """A fresh streaming ``ArrowDigester`` for this schema and options, without analysis."""

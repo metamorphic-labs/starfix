@@ -1,11 +1,12 @@
 //! The Python extension module `starfix._internal` (feature `python`, built by maturin).
 //!
 //! Arrow data crosses through the Arrow `PyCapsule` interface (`__arrow_c_schema__`,
-//! `__arrow_c_array__`): schemas and arrays through arrow-rs's `pyarrow` feature, record
-//! batches through their capsules directly (arrow-rs's `RecordBatch` import applies a struct's
-//! offset twice for a struct nested in a sliced struct, see [`without_struct_offsets`]). The
-//! Python package (`python/starfix`) wraps these classes in starfix-python's interface; every
-//! table is fed one record batch at a time.
+//! `__arrow_c_array__`): schemas through arrow-rs's `pyarrow` feature, arrays and record
+//! batches through their capsules directly (an empty node may omit the offsets buffer that
+//! arrow-rs requires, see [`fill_empty_offsets`]; arrow-rs's `RecordBatch` import applies a
+//! struct's offset twice for a struct nested in a sliced struct, see
+//! [`without_struct_offsets`]). The Python package (`python/starfix`) wraps these classes in
+//! starfix-python's interface; every table is fed one record batch at a time.
 //!
 //! Refusals ([`StarfixError`]) raise `ValueError`. A panic of arrow-rs on invalid Arrow data is
 //! caught at the boundary and raised as `ValueError` too, never as `PanicException`. The GIL is
@@ -25,8 +26,8 @@ use arrow::array::{
     make_array, Array, ArrayData, ArrayDataBuilder, RecordBatch, RecordBatchOptions, StructArray,
 };
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use arrow::pyarrow::{FromPyArrow as _, ToPyArrow as _};
-use arrow_schema::{DataType, Schema};
+use arrow::pyarrow::{FromPyArrow as _, PyArrowException, ToPyArrow as _};
+use arrow_schema::{ArrowError, DataType, Schema};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule, PyTuple};
@@ -132,31 +133,55 @@ fn check_capsule_name(capsule: &Bound<'_, PyCapsule>, expected: &CStr) -> PyResu
     }
 }
 
-/// A record batch from its `__arrow_c_array__` capsules, with its schema's metadata.
-///
-/// With `include_metadata`, metadata repeating a key is refused first, as starfix-python
-/// refuses it (arrow-rs keeps one value of a repeated key on import).
-fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyResult<RecordBatch> {
-    let (schema_capsule, maybe_array_capsule) = capsules(batch, "__arrow_c_array__")?;
+/// The schema and array capsules of `obj.__arrow_c_array__()`, checked by name.
+fn array_capsules<'py>(
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyCapsule>, Bound<'py, PyCapsule>)> {
+    let (schema_capsule, maybe_array_capsule) = capsules(obj, "__arrow_c_array__")?;
     let array_capsule = maybe_array_capsule
         .ok_or_else(|| PyTypeError::new_err("__arrow_c_array__ must return two capsules"))?;
     check_capsule_name(&schema_capsule, c"arrow_schema")?;
     check_capsule_name(&array_capsule, c"arrow_array")?;
+    Ok((schema_capsule, array_capsule))
+}
+
+/// The array of an `arrow_array` capsule exported with `ffi_schema` (of type `data_type`),
+/// moved out of the capsule, its empty nodes given offsets first ([`fill_empty_offsets`]).
+fn take_array(
+    array_capsule: &Bound<'_, PyCapsule>,
+    ffi_schema: &FFI_ArrowSchema,
+    data_type: &DataType,
+) -> Result<ArrayData, ArrowError> {
+    let raw = array_capsule.pointer().cast::<RawArray>();
+    // SAFETY:
+    // The capsule holds a valid `ArrowArray` exported with `ffi_schema`, alive (and owned by the
+    // capsule) until it is moved out below.
+    fill_empty_offsets(unsafe { &*raw }, data_type);
+    // SAFETY:
+    // As above; `from_raw` moves the `ArrowArray` out, leaving a released struct for the
+    // capsule's destructor.
+    let ffi_array = unsafe { FFI_ArrowArray::from_raw(raw.cast::<FFI_ArrowArray>()) };
+    // SAFETY: `ffi_array` was exported with `ffi_schema` (the capsule pair of one export).
+    unsafe { from_ffi(ffi_array, ffi_schema) }
+}
+
+/// A record batch from its `__arrow_c_array__` capsules, with its schema's metadata.
+///
+/// With `include_metadata`, metadata that starfix-python refuses is refused first: a repeated
+/// key (arrow-rs keeps one value of a repeated key on import) and explicit extension metadata
+/// that conflicts with a registered extension type ([`check_extension_metadata`]).
+fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyResult<RecordBatch> {
+    let (schema_capsule, array_capsule) = array_capsules(batch)?;
     // SAFETY:
     // The capsule holds a valid `ArrowSchema` exported by its producer and stays alive (and
     // owns it) until the end of this function.
     let ffi_schema = unsafe { schema_capsule.reference::<FFI_ArrowSchema>() };
-    if include_metadata {
-        check_unique_metadata(ffi_schema)?;
+    if include_metadata && check_metadata(ffi_schema)? {
+        check_extension_metadata(&batch.getattr("schema")?)?;
     }
     let schema = Schema::try_from(ffi_schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    // SAFETY:
-    // The capsule holds a valid `ArrowArray` exported with this schema; `from_raw` moves it out,
-    // leaving a released struct for the capsule's destructor.
-    let ffi_array =
-        unsafe { FFI_ArrowArray::from_raw(array_capsule.pointer().cast::<FFI_ArrowArray>()) };
-    // SAFETY: `ffi_array` was exported with `ffi_schema` (the capsule pair of one export).
-    let raw_data = unsafe { from_ffi(ffi_array, ffi_schema) }
+    let struct_type = DataType::Struct(schema.fields().clone());
+    let raw_data = take_array(&array_capsule, ffi_schema, &struct_type)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     if !matches!(raw_data.data_type(), DataType::Struct(_)) {
         return Err(PyTypeError::new_err(
@@ -174,21 +199,141 @@ fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyRe
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// An array (`pa.Array`) through arrow-rs's `pyarrow` feature.
+/// An array (`pa.Array`) from its `__arrow_c_array__` capsules, as arrow-rs's `pyarrow` feature
+/// imports it (an import error raises `pyarrow.ArrowException`), its empty nodes given offsets.
 fn import_array(array: &Bound<'_, PyAny>) -> PyResult<ArrayData> {
-    Ok(imported(ArrayData::from_pyarrow_bound(array)?))
+    let (schema_capsule, array_capsule) = array_capsules(array)?;
+    // SAFETY: as in `import_record_batch`.
+    let ffi_schema = unsafe { schema_capsule.reference::<FFI_ArrowSchema>() };
+    let arrow_error = |error: ArrowError| PyArrowException::new_err(error.to_string());
+    let data_type = DataType::try_from(ffi_schema).map_err(arrow_error)?;
+    Ok(imported(
+        take_array(&array_capsule, ffi_schema, &data_type).map_err(arrow_error)?,
+    ))
 }
 
 /// A schema through arrow-rs's `pyarrow` feature, metadata included. With `include_metadata`,
-/// metadata repeating a key is refused first.
+/// metadata that starfix-python refuses is refused first, as in [`import_record_batch`].
 fn import_schema(schema: &Bound<'_, PyAny>, include_metadata: bool) -> PyResult<Schema> {
     if include_metadata {
         let (capsule, _) = capsules(schema, "__arrow_c_schema__")?;
         check_capsule_name(&capsule, c"arrow_schema")?;
         // SAFETY: as in `import_record_batch`; the capsule outlives the reference.
-        check_unique_metadata(unsafe { capsule.reference::<FFI_ArrowSchema>() })?;
+        if check_metadata(unsafe { capsule.reference::<FFI_ArrowSchema>() })? {
+            check_extension_metadata(schema)?;
+        }
     }
     Schema::from_pyarrow_bound(schema)
+}
+
+/// Refuse explicit `ARROW:extension:*` field metadata that conflicts with the field's
+/// registered extension type (byte-layout spec Section 7, as starfix-python). pyarrow's export
+/// lets an explicit value replace the type's own, so the conflict shows only in the pyarrow
+/// fields; `starfix.arrow_digester._check_extension_metadata` reads them. Called when the export
+/// carries an extension name.
+fn check_extension_metadata(schema: &Bound<'_, PyAny>) -> PyResult<()> {
+    schema
+        .py()
+        .import("starfix.arrow_digester")?
+        .getattr("_check_extension_metadata")?
+        .call1((schema,))?;
+    Ok(())
+}
+
+/// The C ABI of an exported array (`ArrowArray`, Arrow C Data Interface), to give empty arrays
+/// the offsets buffer arrow-rs's import requires ([`fill_empty_offsets`]).
+#[repr(C)]
+struct RawArray {
+    length: i64,
+    null_count: i64,
+    offset: i64,
+    n_buffers: i64,
+    n_children: i64,
+    buffers: *mut *const c_void,
+    children: *mut *mut Self,
+    dictionary: *mut Self,
+    release: Option<unsafe extern "C" fn(*mut Self)>,
+    private_data: *mut c_void,
+}
+
+/// The offsets buffer of an empty array: one offset `0`, of either width.
+static ZERO_OFFSET: u64 = 0;
+
+/// Whether arrays of the type have an offsets buffer (buffer 1).
+const fn has_offsets(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Map(_, _)
+    )
+}
+
+/// Give every empty node of `array` (any depth, of type `data_type`) that has an offsets type but
+/// no offsets buffer the single offset `0`.
+///
+/// Arrow lets an empty array omit its offsets buffer, and pyarrow exports such arrays (a list
+/// whose rows are all empty, over an empty child without buffers). arrow-rs's import requires
+/// `offset + length + 1` offsets and refuses a null offsets buffer at any depth, though the
+/// array's content does not depend on it. Only the pointer in the export's `buffers` list is
+/// set: the producer's release callback frees what the producer allocated, not what the list
+/// points to, and the imported buffer borrows the static zero.
+fn fill_empty_offsets(array: &RawArray, data_type: &DataType) {
+    if array.length == 0
+        && array.offset == 0
+        && array.n_buffers >= 2
+        && !array.buffers.is_null()
+        && has_offsets(data_type)
+    {
+        // SAFETY: `buffers` points to `n_buffers` (at least 2) buffer pointers (C Data Interface).
+        let slot = unsafe { array.buffers.add(1) };
+        // SAFETY: as above, `slot` is in bounds.
+        if unsafe { slot.read() }.is_null() {
+            // SAFETY: as above; the export belongs to this import until it is moved out.
+            unsafe {
+                slot.write(ptr::from_ref(&ZERO_OFFSET).cast::<c_void>());
+            }
+        }
+    }
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => {
+            if let Some(child) = array_children(array).next() {
+                fill_empty_offsets(child, field.data_type());
+            }
+        }
+        DataType::Struct(fields) => {
+            for (child, field) in array_children(array).zip(fields.iter()) {
+                fill_empty_offsets(child, field.data_type());
+            }
+        }
+        DataType::Dictionary(_, value_type) if !array.dictionary.is_null() => {
+            // SAFETY: a non-null `dictionary` is the valid array of the values (C Data Interface).
+            fill_empty_offsets(unsafe { &*array.dictionary }, value_type);
+        }
+        _ => {}
+    }
+}
+
+fn array_children(array: &RawArray) -> impl Iterator<Item = &RawArray> {
+    let count = usize::try_from(array.n_children).unwrap_or_default();
+    (0..count).filter_map(move |i| {
+        if array.children.is_null() {
+            return None;
+        }
+        // SAFETY: `children` points to `n_children` valid child pointers (C Data Interface).
+        let slot = unsafe { array.children.add(i) };
+        // SAFETY: as above, `slot` is in bounds.
+        let child = unsafe { *slot };
+        // SAFETY: each child pointer is a valid `ArrowArray` owned by the parent.
+        (!child.is_null()).then(|| unsafe { &*child })
+    })
 }
 
 /// Buffers copied where less aligned than arrow-rs requires (pyarrow allows, for example,
@@ -293,24 +438,33 @@ struct RawSchema {
     private_data: *mut c_void,
 }
 
-/// Refuse metadata that repeats a key, on the schema or on any node (byte-layout spec Section
-/// 7, as starfix-python), with starfix-python's message.
-fn check_unique_metadata(schema: &FFI_ArrowSchema) -> PyResult<()> {
+const EXTENSION_NAME: &[u8] = b"ARROW:extension:name";
+const EXTENSION_METADATA: &[u8] = b"ARROW:extension:metadata";
+
+/// `schema` as the C ABI it is: `FFI_ArrowSchema` is `#[repr(C)]` with exactly the
+/// `ArrowSchema` layout of the C Data Interface.
+const fn raw_schema(schema: &FFI_ArrowSchema) -> &RawSchema {
     let raw = ptr::from_ref(schema).cast::<RawSchema>();
-    // SAFETY:
-    // `FFI_ArrowSchema` is `#[repr(C)]` with exactly the `ArrowSchema` layout of the C Data
-    // Interface, and `schema` is a valid exported schema, alive for this call.
-    let root = unsafe { &*raw };
-    if let Some(key) = repeated_key(root) {
+    // SAFETY: same layout (above); `schema` is a valid exported schema, alive as long as `&`.
+    unsafe { &*raw }
+}
+
+/// Refuse metadata that repeats a key, on the schema or on any node (byte-layout spec Section
+/// 7, as starfix-python), with starfix-python's message. Returns whether a field node or a
+/// dictionary below one carries `ARROW:extension:name` (an extension type, or its metadata).
+fn check_metadata(schema: &FFI_ArrowSchema) -> PyResult<bool> {
+    let root = raw_schema(schema);
+    if let Some(key) = repeated_key(&metadata_pairs(root)) {
         return Err(PyValueError::new_err(format!(
             "Duplicate metadata key {} on the schema: ambiguous, rejected with include_metadata",
             py_repr(&key)
         )));
     }
+    let mut extension = false;
     for child in children(root) {
-        check_node(child, &node_name(child))?;
+        extension |= check_node(child, &node_name(child))?;
     }
-    Ok(())
+    Ok(extension)
 }
 
 /// A string as Python's `repr` writes it (the quotes of starfix-python's messages).
@@ -374,9 +528,11 @@ fn children(node: &RawSchema) -> impl Iterator<Item = &RawSchema> {
 }
 
 /// The field node at `path` and its descendants (node paths of byte-layout spec Section 3.1;
-/// a dictionary is its value type, a map's entries struct is not a node).
-fn check_node(node: &RawSchema, path: &str) -> PyResult<()> {
-    if let Some(key) = repeated_key(node) {
+/// a dictionary, at any depth, is its value type; a map's entries struct is not a node).
+/// Returns whether any of them carries `ARROW:extension:name`.
+fn check_node(node: &RawSchema, path: &str) -> PyResult<bool> {
+    let pairs = metadata_pairs(node);
+    if let Some(key) = repeated_key(&pairs) {
         return Err(PyValueError::new_err(format!(
             "Field {}: Duplicate metadata key {} on the field: ambiguous, rejected with \
              include_metadata",
@@ -384,22 +540,23 @@ fn check_node(node: &RawSchema, path: &str) -> PyResult<()> {
             py_repr(&key)
         )));
     }
-    let logical = if node.dictionary.is_null() {
-        node
-    } else {
+    let mut extension = has_key(&pairs, EXTENSION_NAME);
+    let mut logical = node;
+    while !logical.dictionary.is_null() {
         // SAFETY: a non-null `dictionary` is the valid value-type schema (C Data Interface).
-        unsafe { &*node.dictionary }
-    };
+        logical = unsafe { &*logical.dictionary };
+        extension |= has_key(&metadata_pairs(logical), EXTENSION_NAME);
+    }
     match format_of(logical) {
         "+s" => {
             for child in children(logical) {
-                check_node(child, &format!("{path}/{}", node_name(child)))?;
+                extension |= check_node(child, &format!("{path}/{}", node_name(child)))?;
             }
         }
         "+m" => {
             for entries in children(logical) {
                 for (child, name) in children(entries).zip(["key", "value"]) {
-                    check_node(child, &format!("{path}//{name}"))?;
+                    extension |= check_node(child, &format!("{path}//{name}"))?;
                 }
             }
         }
@@ -407,23 +564,23 @@ fn check_node(node: &RawSchema, path: &str) -> PyResult<()> {
             if format.starts_with("+l") || format.starts_with("+L") || format.starts_with("+w") =>
         {
             for child in children(logical) {
-                check_node(child, &format!("{path}/"))?;
+                extension |= check_node(child, &format!("{path}/"))?;
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(extension)
 }
 
-/// The first key that a node's exported metadata repeats: `int32` count, then per pair `int32`
-/// length + key bytes and `int32` length + value bytes (C Data Interface).
-fn repeated_key(node: &RawSchema) -> Option<String> {
+/// A node's exported metadata, every pair in order (repeated keys kept): `int32` count, then per
+/// pair `int32` length + key bytes and `int32` length + value bytes (C Data Interface).
+fn metadata_pairs(node: &RawSchema) -> Vec<(Vec<u8>, Vec<u8>)> {
     if node.metadata.is_null() {
-        return None;
+        return Vec::new();
     }
     let mut pos = node.metadata.cast::<u8>();
     let count = read_length(&mut pos);
-    let mut seen = HashSet::new();
+    let mut pairs = Vec::new();
     for _ in 0..count {
         let key_len = read_length(&mut pos);
         // SAFETY: `key_len` bytes of key follow (C Data Interface).
@@ -432,12 +589,33 @@ fn repeated_key(node: &RawSchema) -> Option<String> {
         pos = unsafe { pos.add(key_len) };
         let value_len = read_length(&mut pos);
         // SAFETY: `value_len` bytes of value follow (C Data Interface).
+        let value = unsafe { slice::from_raw_parts(pos, value_len) }.to_vec();
+        // SAFETY: as above.
         pos = unsafe { pos.add(value_len) };
-        if !seen.insert(key.clone()) {
-            return Some(String::from_utf8_lossy(&key).into_owned());
-        }
+        pairs.push((key, value));
     }
-    None
+    pairs
+}
+
+/// The first key that the pairs repeat.
+fn repeated_key(pairs: &[(Vec<u8>, Vec<u8>)]) -> Option<String> {
+    let mut seen = HashSet::new();
+    pairs
+        .iter()
+        .find(|(key, _)| !seen.insert(key.as_slice()))
+        .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
+}
+
+fn has_key(pairs: &[(Vec<u8>, Vec<u8>)], key: &[u8]) -> bool {
+    pairs.iter().any(|(k, _)| k.as_slice() == key)
+}
+
+/// The value of `key` in the pairs (the first), or empty.
+fn value_of<'a>(pairs: &'a [(Vec<u8>, Vec<u8>)], key: &[u8]) -> &'a [u8] {
+    pairs
+        .iter()
+        .find(|(k, _)| k.as_slice() == key)
+        .map_or(&[], |(_, value)| value.as_slice())
 }
 
 /// Read an `int32` of the metadata encoding at `pos` and advance past it.
@@ -451,6 +629,26 @@ fn read_length(pos: &mut *const u8) -> usize {
 
 fn bytes<'py>(py: Python<'py>, digest: &[u8]) -> Bound<'py, PyBytes> {
     PyBytes::new(py, digest)
+}
+
+/// The `ARROW:extension:name` and `ARROW:extension:metadata` values pyarrow exports for
+/// `field` (empty when absent): for a field of an extension type without metadata, the type's
+/// own name and serialization.
+#[pyfunction]
+fn extension_metadata<'py>(
+    py: Python<'py>,
+    field: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let (capsule, _) = capsules(field, "__arrow_c_schema__")?;
+    check_capsule_name(&capsule, c"arrow_schema")?;
+    // SAFETY: as in `import_record_batch`; the capsule outlives the reference.
+    let pairs = metadata_pairs(raw_schema(unsafe {
+        capsule.reference::<FFI_ArrowSchema>()
+    }));
+    Ok((
+        bytes(py, value_of(&pairs, EXTENSION_NAME)),
+        bytes(py, value_of(&pairs, EXTENSION_METADATA)),
+    ))
 }
 
 /// `ArrowDigester.hash_schema`.
@@ -483,8 +681,8 @@ fn hash_record_batch<'py>(
     Ok(bytes(py, &digest))
 }
 
-/// `ArrowDigester.hash_table`: a digester over `batches`, the table's record batches (at least
-/// one: the Python layer passes an empty batch for a table without any).
+/// `ArrowDigester.hash_table`: a digester over `batches`, the table's record batches (a table
+/// without any hashes as a digester without updates, equal to one empty batch).
 #[pyfunction]
 fn hash_table<'py>(
     py: Python<'py>,
@@ -613,32 +811,29 @@ impl Prepared {
         Ok(bytes(py, &digest))
     }
 
-    /// Hash a table of the prepared schema, given its record batches (at least one).
+    /// Hash a table of the prepared schema, given its schema and record batches. A table
+    /// without batches hashes as one empty batch of its schema, so its schema is checked too.
     fn hash_table<'py>(
         &self,
         py: Python<'py>,
+        py_schema: &Bound<'py, PyAny>,
         batches: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut digester = self.digester(py)?;
+        let include_metadata = digester.include_metadata;
+        let mut empty = true;
         for py_batch in batches.try_iter()? {
-            let batch = import_record_batch(&py_batch?, digester.include_metadata)?;
-            let inner = &mut digester.digester;
-            hashing(py, || {
-                inner.try_update(&batch).map_err(|error| match error {
-                    StarfixError::SchemaMismatch => StarfixError::PreparedSchemaMismatch,
-                    other => other,
-                })
-            })
-            .map_err(|error| {
-                if error
-                    .to_string()
-                    .contains("does not match the prepared schema")
-                {
-                    PyValueError::new_err("Table schema does not match the prepared schema")
-                } else {
-                    error
-                }
-            })?;
+            empty = false;
+            let batch = import_record_batch(&py_batch?, include_metadata)?;
+            table_update(py, &mut digester.digester, &batch)?;
+        }
+        if empty {
+            let schema = import_schema(py_schema, include_metadata)?;
+            table_update(
+                py,
+                &mut digester.digester,
+                &RecordBatch::new_empty(Arc::new(schema)),
+            )?;
         }
         Ok(digester.finalize(py))
     }
@@ -653,6 +848,26 @@ impl Prepared {
     }
 }
 
+/// Add a batch of a table to a prepared schema's digester; a schema mismatch is the table's.
+fn table_update(py: Python<'_>, digester: &mut ArrowDigester, batch: &RecordBatch) -> PyResult<()> {
+    hashing(py, || {
+        digester.try_update(batch).map_err(|error| match error {
+            StarfixError::SchemaMismatch => StarfixError::PreparedSchemaMismatch,
+            other => other,
+        })
+    })
+    .map_err(|error| {
+        if error
+            .to_string()
+            .contains("does not match the prepared schema")
+        {
+            PyValueError::new_err("Table schema does not match the prepared schema")
+        } else {
+            error
+        }
+    })
+}
+
 /// The extension module.
 #[pymodule]
 fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -661,6 +876,7 @@ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(hash_record_batch, module)?)?;
     module.add_function(wrap_pyfunction!(hash_table, module)?)?;
     module.add_function(wrap_pyfunction!(hash_array, module)?)?;
+    module.add_function(wrap_pyfunction!(extension_metadata, module)?)?;
     module.add_class::<Digester>()?;
     module.add_class::<Prepared>()?;
     Ok(())

@@ -68,9 +68,16 @@ were wrong.** The hash format does not change (still 2).
 - `starfix.legacy.v0_4` (format 1) is starfix-python's frozen pure-Python module, shipped
   unchanged.
 - Arrow data crosses through the Arrow PyCapsule interface (pyarrow >= 14; arrow-rs's `pyarrow`
-  feature for schemas and arrays). Two inputs pyarrow exports that arrow-rs's import refused or
-  mishandled are handled: a struct nested in a sliced struct or fixed-size list (arrow-rs
-  applies the offset twice), and buffers less aligned than arrow-rs requires (copied).
+  feature for schemas). Inputs pyarrow exports that arrow-rs's import refused or mishandled are
+  handled: a struct nested in a sliced struct or fixed-size list (arrow-rs applies the offset
+  twice), buffers less aligned than arrow-rs requires (copied), and empty arrays without an
+  offsets buffer at any depth, such as the empty child of a list whose rows are all empty
+  (starfix-python 0.5.0 hashes them as the allocated equivalent; so does the package now).
+- With `include_metadata`, as starfix-python: explicit `ARROW:extension:*` field metadata that
+  conflicts with the field's registered extension type is refused (pyarrow's export hides the
+  conflict), and repeated metadata keys are refused below dictionaries of dictionaries too.
+- `PreparedSchema.hash_table` of a table without record batches checks the table's schema also
+  when pyarrow cannot build an empty batch of it (a year-month interval column, for example).
 - The GIL is released while batches and arrays are hashed. Wheels are abi3 (Python >= 3.10).
 - uniffi, its bindgen binary and `uniffi.toml` are removed (Python was their only consumer).
   PyO3 is an optional dependency (feature `python`): the Rust crate does not depend on it.
