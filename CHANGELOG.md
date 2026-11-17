@@ -83,6 +83,14 @@ were wrong.** The hash format does not change (still 2).
   PyO3 is an optional dependency (feature `python`): the Rust crate does not depend on it.
 - Runtime dependencies: `pyarrow>=14` only (`ipykernel` and `maturin` were listed as runtime
   dependencies).
+- A seeded differential harness (`python/tests/test_harness.py`, `_harness.py`) compares the
+  package with starfix-python 0.5.0 on generated tables: every leaf type, nesting, dictionaries
+  and extension types, names and time zones with NUL, metadata that is not UTF-8, offsets at
+  every depth, bufferless empty arrays, many and empty batches, and invalid data. Both sides
+  build each table in process. Each call must give the same digest, or both sides must raise
+  in the same class. CI runs 2,000 seeds on every pull request and 100,000 nightly and before a
+  release (`differential-harness.yml`), on the newest pyarrow and on Python 3.10 with pyarrow
+  19 (starfix-python 0.5.0's floor).
 - CI builds the package and runs its tests, the differential test against starfix-python 0.5.0,
   and starfix-python's own test suite against it, on the newest pyarrow and on the floor
   (Python 3.10, pyarrow 14). `maturin-release.yml` builds and tests the wheels of every
