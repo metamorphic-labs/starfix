@@ -72,12 +72,34 @@ fn value_error(py: Python<'_>, error: &StarfixError) -> PyErr {
     PyValueError::new_err(message)
 }
 
-/// pyarrow's name of a type (`str(pa_type)`), or arrow-rs's when pyarrow cannot take it.
+/// pyarrow's name of a type (`str(pa_type)`), or arrow-rs's when pyarrow cannot take it or a
+/// field name in it contains NUL (arrow-rs's export of such a name panics).
 fn pyarrow_name(py: Python<'_>, data_type: &DataType) -> String {
+    if has_nul_name(data_type) {
+        return data_type.to_string();
+    }
     data_type
         .to_pyarrow(py)
         .and_then(|pa_type| pa_type.str().map(|name| name.to_string()))
         .unwrap_or_else(|_| data_type.to_string())
+}
+
+/// Whether a field name in `data_type`, at any depth, contains NUL.
+fn has_nul_name(data_type: &DataType) -> bool {
+    let nul_in = |field: &Field| field.name().contains('\0') || has_nul_name(field.data_type());
+    match data_type {
+        DataType::Struct(fields) => fields.iter().any(|field| nul_in(field)),
+        DataType::Union(fields, _) => fields.iter().any(|(_, field)| nul_in(field)),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => nul_in(field),
+        DataType::RunEndEncoded(run_ends, values) => nul_in(run_ends) || nul_in(values),
+        DataType::Dictionary(_, value) => has_nul_name(value),
+        _ => false,
+    }
 }
 
 /// Run `f` (hashing; no Python objects) without the GIL. A panic (arrow-rs on invalid Arrow
