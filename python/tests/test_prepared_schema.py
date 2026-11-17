@@ -49,10 +49,7 @@ def test_golden_vector_through_prepared_path(v):
     else:  # hash_stream
         digester = prepared.digester()
         for batch in batches:
-            # PyArrowDigester.update hashes the first batch of a table, and a table of an
-            # empty batch has none; an empty batch does not change the hash.
-            if batch.num_rows:
-                digester.update(pa.Table.from_batches([batch]))
+            digester.update(batch)
         got = digester.finalize()
         assert prepared.hash_table(pa.Table.from_batches(batches, schema=schema)) == got
     assert got.hex() == v["expected_hash"]

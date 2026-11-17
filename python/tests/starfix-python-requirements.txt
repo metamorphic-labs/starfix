@@ -1,0 +1,6 @@
+# starfix-python (the pure-Python implementation, on PyPI as "starfix") for the differential
+# test (test_differential.py). Installed with --no-deps --require-hashes into its own
+# environment: it is imported as "starfix", like this binding.
+starfix==0.5.0 \
+    --hash=sha256:6982fa4598f99e20428b76041378e3203f2894e6542f6e3ba75746bdbfea0ad2 \
+    --hash=sha256:677f001fae5f0173c52ffaaf761fb96becf856ff679ab5d201208f453396a9fb

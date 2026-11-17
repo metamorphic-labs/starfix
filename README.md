@@ -200,3 +200,20 @@ See `docs/byte-layout-spec.md`, Section 10, and the [CHANGELOG](CHANGELOG.md).
 Regenerate the golden file (append-only) with `cargo run --bin emit_golden_format2`.
 `tests/golden_vectors_format2.rs` also requires a minimum vector and relation count, so a
 regeneration that drops vectors fails even if the generator was edited too.
+
+### The Python binding (`python/starfix`)
+
+The binding built from this repository with maturin (not starfix-python) has its own tests in
+`python/tests`: the golden vectors through every call, tables in several chunks, slices and
+empty tables, and `test_differential.py`, which compares every result with starfix-python
+under all 8 option combinations. Both packages import as `starfix`, so starfix-python runs in a
+separate environment named by `STARFIX_PYTHON` (the test is skipped without it):
+
+```sh
+maturin develop --skip-install        # builds python/starfix/_internal in place
+python -m venv /tmp/sfp && /tmp/sfp/bin/pip install pyarrow \
+  && /tmp/sfp/bin/pip install --no-deps --require-hashes -r python/tests/starfix-python-requirements.txt
+STARFIX_PYTHON=/tmp/sfp/bin/python PYTHONPATH=python python -m pytest python/tests
+```
+
+CI runs the same against a built wheel (`.github/workflows/ci.yml`, job `python-binding`).
