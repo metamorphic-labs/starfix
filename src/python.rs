@@ -859,7 +859,11 @@ fn check_node(py: Python<'_>, node: &RawSchema, path: &str) -> PyResult<bool> {
     while !logical.dictionary.is_null() {
         // SAFETY: a non-null `dictionary` is the valid value-type schema (C Data Interface).
         logical = unsafe { &*logical.dictionary };
-        extension |= has_key(&metadata_pairs(logical), EXTENSION_NAME);
+        // A dictionary's value node carries the keys of an extension value type, which the
+        // field's metadata takes (`with_dictionary_extensions`): they must be UTF-8 too.
+        let value_pairs = metadata_pairs(logical);
+        check_utf8(py, &value_pairs)?;
+        extension |= has_key(&value_pairs, EXTENSION_NAME);
     }
     match format_of(logical) {
         "+s" => {

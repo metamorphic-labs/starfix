@@ -61,10 +61,25 @@ class Point(pa.ExtensionType):
         return cls()
 
 
-try:
-    pa.register_extension_type(Point())
-except pa.ArrowKeyError:
-    pass  # registered by an earlier import
+class BinaryPoint(pa.ExtensionType):
+    """A Point whose serialization is not UTF-8 (starfix-python cannot decode it)."""
+
+    def __init__(self):
+        super().__init__(pa.struct([("x", pa.int64())]), "starfix.test.binary-point")
+
+    def __arrow_ext_serialize__(self):
+        return b"\xff"
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls()
+
+
+for _extension_type in (Point(), BinaryPoint()):
+    try:
+        pa.register_extension_type(_extension_type)
+    except pa.ArrowKeyError:
+        pass  # registered by an earlier import
 
 
 def point_batch(schema: pa.Schema) -> pa.RecordBatch:
@@ -87,8 +102,12 @@ def dictionary_of_point_batches() -> dict[str, pa.RecordBatch]:
     column = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0], pa.int8()), values)
     field = pa.field("d", column.type)
     nested = pa.StructArray.from_arrays([column], fields=[field])
+    binary_values = pa.ExtensionArray.from_storage(BinaryPoint(), storage)
+    binary_column = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0], pa.int8()), binary_values)
     return {
         "top": pa.RecordBatch.from_arrays([column], schema=pa.schema([field])),
+        # A serialization that is not UTF-8: refused with include_metadata (UnicodeDecodeError).
+        "binary-serialization": pa.RecordBatch.from_arrays([binary_column], names=["d"]),
         "with-field-metadata": pa.RecordBatch.from_arrays(
             [column], schema=pa.schema([field.with_metadata({"k": "v"})])
         ),
