@@ -30,7 +30,7 @@ import pyarrow as pa
 
 from _parity_cases import bufferless_empty
 
-GENERATOR_VERSION = 3
+GENERATOR_VERSION = 4
 
 
 class HarnessExtension(pa.ExtensionType):
@@ -60,7 +60,11 @@ class Case:
     schema: pa.Schema
     batches: list[pa.RecordBatch]
     tags: set[str] = field(default_factory=set)
-    defect_columns: set[int] = field(default_factory=set)  # columns holding invalid data
+    # Where the case's invalid data (at most one defect) is visible: the record batches that hold
+    # it, and the columns whose hash_array reads it (a null in a non-nullable top-level field is
+    # invisible to hash_array, which has no field).
+    defect_batches: set[int] = field(default_factory=set)
+    defect_arrays: set[int] = field(default_factory=set)
 
 
 # --- types --------------------------------------------------------------------------------
@@ -88,7 +92,8 @@ class _Generator:
         # either one first, which is not a difference.
         self.defect = False
         self.column = 0  # the top-level column being built
-        self.defect_columns: set[int] = set()
+        self.defect_kind: str | None = None
+        self.defect_column = 0
 
     def chance(self, p: float) -> bool:
         return self.rng.random() < p
@@ -182,11 +187,12 @@ class _Generator:
 
     # arrays
 
-    def validity(self, length: int, nullable: bool | None) -> tuple[list[bool], int]:
-        """Row validity; `nullable` False sometimes gets a null anyway (refused by both), None
-        never (map keys: pyarrow aborts on a null key). Only a null actually drawn counts as
-        the case's defect."""
-        if nullable is None or (not nullable and (self.defect or not self.chance(0.03))):
+    def validity(self, length: int, nullable: bool | None, top: bool = False) -> tuple[list[bool], int]:
+        """Row validity; a non-nullable top-level column sometimes gets a null anyway (refused by
+        both), a non-nullable nested field never (its nulls could be masked by an ancestor's:
+        not a defect one can locate), and `nullable` None never (map keys: pyarrow aborts on a
+        null key). Only a null actually drawn counts as the case's defect."""
+        if nullable is None or (not nullable and (not top or self.defect or not self.chance(0.03))):
             return [True] * length, 0
         valid = [not self.chance(0.25) for _ in range(length)]
         if not nullable and False in valid:
@@ -196,34 +202,35 @@ class _Generator:
     def mark_defect(self, tag: str) -> None:
         self.defect = True
         self.tags.add(tag)
-        self.defect_columns.add(self.column)
+        self.defect_kind = tag
+        self.defect_column = self.column
 
     def array(self, t: pa.DataType, length: int, nullable: bool | None = True, top: bool = False) -> pa.Array:
         """An array of `t`, sometimes a slice of a longer one (an offset at this depth). Only a
         top-level dictionary column, never sliced, may get an invalid key: one outside a slice
         is not part of the array (the binding hashes the array, starfix-python 0.5.0 raises)."""
         if top and pa.types.is_dictionary(t):
-            valid, _ = self.validity(length, nullable)
-            return self.dictionary_array(t, length, valid, invalid_key=True)
+            valid, _ = self.validity(length, nullable, top)
+            return self.dictionary_array(t, length, valid, nullable, invalid_key=True)
         if length == 0 and self.chance(0.15) and _bufferless_ok(t):
             self.tags.add("bufferless-empty")
             return bufferless_empty(t)
         if self.chance(0.25):
             self.tags.add("offset")
             before, after = self.rng.randint(0, 3), self.rng.randint(0, 2)
-            return self._array(t, before + length + after, nullable).slice(before, length)
-        return self._array(t, length, nullable)
+            return self._array(t, before + length + after, nullable, top).slice(before, length)
+        return self._array(t, length, nullable, top)
 
-    def _array(self, t: pa.DataType, length: int, nullable: bool | None) -> pa.Array:
+    def _array(self, t: pa.DataType, length: int, nullable: bool | None, top: bool = False) -> pa.Array:
         if isinstance(t, pa.BaseExtensionType):  # its validity is its storage's
-            return pa.ExtensionArray.from_storage(t, self.array(t.storage_type, length, nullable))
-        valid, null_count = self.validity(length, nullable)
+            return pa.ExtensionArray.from_storage(t, self.array(t.storage_type, length, nullable, top))
+        valid, null_count = self.validity(length, nullable, top)
         validity = pa.array(valid, pa.bool_()).buffers()[1] if null_count else None
         if pa.types.is_float16(t):  # pyarrow < 26 builds float16 only from NumPy values
             data = struct.pack(f"<{length}e", *(self.value(t) if ok else 0.0 for ok in valid))
             return pa.Array.from_buffers(t, length, [validity, pa.py_buffer(data)], null_count)
         if pa.types.is_dictionary(t):
-            return self.dictionary_array(t, length, valid)
+            return self.dictionary_array(t, length, valid, nullable)
         if pa.types.is_struct(t):
             children = [self.array(t.field(i).type, length, t.field(i).nullable) for i in range(t.num_fields)]
             return pa.Array.from_buffers(t, length, [validity], null_count, children=children)
@@ -248,9 +255,12 @@ class _Generator:
             return pa.nulls(length)
         return pa.array([self.value(t) if ok else None for ok in valid], t)
 
-    def dictionary_array(self, t: pa.DataType, length: int, valid: list[bool], invalid_key: bool = False) -> pa.Array:
+    def dictionary_array(
+        self, t: pa.DataType, length: int, valid: list[bool], nullable: bool | None, invalid_key: bool = False
+    ) -> pa.Array:
         size = self.rng.randint(1, 4)
-        dictionary = self.array(t.value_type, size, True)
+        # The values take the field's nullability: a valid key must not select an untracked null.
+        dictionary = self.array(t.value_type, size, nullable is not False)
         keys = [self.rng.randrange(size) if ok else None for ok in valid]
         if invalid_key and length and not self.defect and self.chance(0.1):
             self.mark_defect("invalid-dictionary-key")
@@ -321,7 +331,26 @@ class _Generator:
                 self.tags.add("multi-chunk")
         else:
             self.tags.add("no-batches")
-        return Case(seed, schema, batches, self.tags, self.defect_columns)
+        defect_batches, defect_arrays = self.locate_defect(batches)
+        return Case(seed, schema, batches, self.tags, defect_batches, defect_arrays)
+
+    def locate_defect(self, batches: list[pa.RecordBatch]) -> tuple[set[int], set[int]]:
+        """The batches that hold the defect visibly (slices may have cut it away), and the
+        columns whose hash_array sees it."""
+        if self.defect_kind is None:
+            return set(), set()
+        held = set()
+        for j, batch in enumerate(batches):
+            column = batch.column(self.defect_column)
+            while isinstance(column, pa.ExtensionArray):
+                column = column.storage
+            if self.defect_kind == "null-in-non-nullable":
+                if column.null_count:
+                    held.add(j)
+            elif any(k is not None and k >= len(column.dictionary) for k in column.indices.to_pylist()):
+                held.add(j)
+        arrays = {self.defect_column} if held and self.defect_kind == "invalid-dictionary-key" else set()
+        return held, arrays
 
 
 def _bufferless_ok(t: pa.DataType) -> bool:
@@ -456,7 +485,7 @@ def _fresh(array: pa.Array) -> pa.Array:
 def fresh_case(case: Case) -> Case:
     """`case` with every column rebuilt by `_fresh`, in the same batches."""
     batches = [pa.RecordBatch.from_arrays([_fresh(c) for c in b.columns], schema=b.schema) for b in case.batches]
-    return Case(case.seed, case.schema, batches, case.tags, case.defect_columns)
+    return Case(case.seed, case.schema, batches, case.tags, case.defect_batches, case.defect_arrays)
 
 
 def seed_difference_holds(
@@ -476,10 +505,14 @@ def allowlisted(reference: str, seed: int) -> bool:
 
 
 def observes_defect(case: Case, call: str) -> bool:
-    """Whether a call reads the column holding the case's invalid data (schemas never do)."""
+    """Whether a call reads the case's invalid data where it is visible (schemas never do)."""
+    if call == "hash_schema":
+        return False
     if call.startswith("hash_array["):
-        return int(call[len("hash_array[") : -1]) in case.defect_columns
-    return call != "hash_schema" and bool(case.defect_columns)
+        return int(call[len("hash_array[") : -1]) in case.defect_arrays
+    if call.startswith("hash_record_batch["):
+        return int(call[len("hash_record_batch[") : -1]) in case.defect_batches
+    return bool(case.defect_batches)  # hash_table, stream
 
 
 def needs_fresh(reference: str, name: str) -> bool:

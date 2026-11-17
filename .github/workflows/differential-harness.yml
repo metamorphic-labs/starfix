@@ -95,6 +95,8 @@ jobs:
           name: harness-wheel
           path: dist
       - name: Install the wheel, and the reference starfix-python with the same pyarrow in its own environment
+        env:
+          REFERENCE_REQUIREMENTS: ${{ inputs.reference_requirements || 'python/tests/starfix-python-requirements.txt' }}
         run: |
           python -m venv .venv-starfix
           .venv-starfix/bin/pip install dist/*.whl pytest
@@ -104,7 +106,7 @@ jobs:
           PYARROW=$(.venv-starfix/bin/python -c "import pyarrow; print(pyarrow.__version__)")
           python -m venv .venv-starfix-python
           .venv-starfix-python/bin/pip install "pyarrow==${PYARROW}"
-          .venv-starfix-python/bin/pip install --no-deps --require-hashes -r "${{ inputs.reference_requirements || 'python/tests/starfix-python-requirements.txt' }}"
+          .venv-starfix-python/bin/pip install --no-deps --require-hashes -r "${REFERENCE_REQUIREMENTS}"
       - name: The harness, this shard's seeds
         env:
           STARFIX_PYTHON: ${{ github.workspace }}/.venv-starfix-python/bin/python
