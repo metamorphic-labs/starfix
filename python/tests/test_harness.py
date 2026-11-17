@@ -10,7 +10,7 @@ any class (either of its refusals may come first); a crash never matches. Both e
 must have the same pyarrow (the inputs are built in each).
 
 ``STARFIX_HARNESS_SEEDS`` is ``start:count`` (default ``0:200``): CI runs 2,000 seeds on every
-pull request and 50,000, in shards, before a release. Skipped when ``STARFIX_PYTHON`` is unset,
+pull request and 100,000, in shards, nightly and before a release. Skipped when ``STARFIX_PYTHON`` is unset,
 unless ``STARFIX_REQUIRE_DIFFERENTIAL`` is set, where it fails instead.
 
 The reference is ``STARFIX_REFERENCE_VERSION`` (default 0.5.0). Named differences are expected

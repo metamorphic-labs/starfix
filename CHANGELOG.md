@@ -88,7 +88,7 @@ were wrong.** The hash format does not change (still 2).
   and extension types, names and time zones with NUL, metadata that is not UTF-8, offsets at
   every depth, bufferless empty arrays, many and empty batches, and invalid data. Both sides
   build each table in process. Each call must give the same digest, or both sides must raise
-  in the same class. CI runs 2,000 seeds on every pull request and 50,000 nightly and before a
+  in the same class. CI runs 2,000 seeds on every pull request and 100,000 nightly and before a
   release (`differential-harness.yml`), on the newest pyarrow and on Python 3.10 with pyarrow
   19 (starfix-python 0.5.0's floor).
 - CI builds the package and runs its tests, the differential test against starfix-python 0.5.0,
