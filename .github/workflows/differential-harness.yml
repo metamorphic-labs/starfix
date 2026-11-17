@@ -5,7 +5,8 @@
 # raise on both sides in the same class; a crash always fails.
 #
 # Tiers: ci.yml calls it on every pull request and push with 2,000 seeds (one shard per leg);
-# the release tier is 50,000 seeds in 4 shards per leg, nightly and on demand, and the publish
+# the release tier is 100,000 seeds in 8 shards per leg (12,500 seeds a shard, 5-12 minutes;
+# about 145 job minutes, 13 minutes of wall time), nightly and on demand, and the publish
 # jobs need it before a release. Legs: the newest pyarrow, and the oldest Python and pyarrow
 # that starfix-python 0.5.0 supports (Python 3.10, pyarrow 19).
 name: differential-harness
@@ -34,11 +35,11 @@ on:
       seeds:
         description: Number of seeds, split evenly over the shards
         type: number
-        default: 50000
+        default: 100000
       shards:
         description: 'The shards to run, as a JSON list'
         type: string
-        default: '[0, 1, 2, 3]'
+        default: '[0, 1, 2, 3, 4, 5, 6, 7]'
       reference:
         description: The starfix-python version to compare with
         type: string
@@ -81,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(inputs.shards || '[0, 1, 2, 3]') }}
+        shard: ${{ fromJSON(inputs.shards || '[0, 1, 2, 3, 4, 5, 6, 7]') }}
         leg:
           - { name: 'newest pyarrow', python: '3.13', pyarrow: '' }
           - { name: 'floor, Python 3.10, pyarrow 19', python: '3.10', pyarrow: '19.0.1' }
@@ -112,8 +113,8 @@ jobs:
           STARFIX_PYTHON: ${{ github.workspace }}/.venv-starfix-python/bin/python
           STARFIX_REQUIRE_DIFFERENTIAL: '1'
           STARFIX_REFERENCE_VERSION: ${{ inputs.reference || '0.5.0' }}
-          SEEDS: ${{ inputs.seeds || 50000 }}
-          SHARDS: ${{ inputs.shards || '[0, 1, 2, 3]' }}
+          SEEDS: ${{ inputs.seeds || 100000 }}
+          SHARDS: ${{ inputs.shards || '[0, 1, 2, 3, 4, 5, 6, 7]' }}
           SHARD: ${{ matrix.shard }}
         run: |
           # Cumulative boundaries: shard k of n gets seeds [k*S//n, (k+1)*S//n), so every seed is
