@@ -8,9 +8,16 @@ on:
         required: true
         type: string
 
+# Every job gets a read-only GITHUB_TOKEN unless it asks for more.
+permissions:
+  contents: read
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    # The crates.io trusted publisher of `starfix` is registered for this repository, this
+    # workflow and the environment `crates`; the OIDC token is accepted only from this job.
+    environment: crates
     permissions:
       contents: write   # cargo-release commits + pushes
       id-token: write   # crates.io trusted publishing (OIDC — no API token needed)
