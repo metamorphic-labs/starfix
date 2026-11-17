@@ -5,8 +5,9 @@ invalid data drawn together), in this process and in starfix-python's (``STARFIX
 by ``starfix_python_harness_worker.py``), without IPC. Every call (hash_schema, hash_table, a
 stream, hash_record_batch per batch, hash_array per column) under all 8 option sets must give
 the same digest on both sides, or raise on both sides in the same class (``_harness.classify``:
-refusal, invalid data, wrong type), or in any class for an input with invalid data (either of
-its refusals may come first); a crash never matches.
+refusal, invalid data, wrong type), or, for a call that reads a column holding invalid data, in
+any class (either of its refusals may come first); a crash never matches. Both environments
+must have the same pyarrow (the inputs are built in each).
 
 ``STARFIX_HARNESS_SEEDS`` is ``start:count`` (default ``0:200``): CI runs 2,000 seeds on every
 pull request and 50,000, in shards, before a release. Skipped when ``STARFIX_PYTHON`` is unset,
@@ -32,11 +33,14 @@ import pyarrow as pa
 
 from _harness import (
     DEFAULT_REFERENCE,
-    DEFECTS,
     GENERATOR_VERSION,
     NAMED_CASES,
+    allowlisted,
     build_case,
+    fresh_case,
     named_case_holds,
+    needs_fresh,
+    observes_defect,
     outcomes,
     same_outcome,
     seed_difference_holds,
@@ -70,24 +74,27 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
     worker = json.loads(results_path.read_text())
     assert worker["starfix_version"] == REFERENCE, f"the worker must run starfix-python {REFERENCE}"
     assert worker["generator_version"] == GENERATOR_VERSION
-    assert pa.__version__, "both environments install the same pyarrow (CI pins it)"
+    assert worker["pyarrow_version"] == pa.__version__, (
+        f"both environments must build the same inputs: pyarrow {pa.__version__} here, "
+        f"{worker['pyarrow_version']} in STARFIX_PYTHON's environment"
+    )
 
     failures, counts = [], collections.Counter()
     for seed in range(start, start + count):
         case = build_case(seed)
         theirs = worker["results"][str(seed)]
-        defective = bool(case.tags & DEFECTS)
+        fresh = outcomes(ArrowDigester, fresh_case(case), OPTION_SETS) if allowlisted(REFERENCE, seed) else None
         for key, calls in outcomes(ArrowDigester, case, OPTION_SETS).items():
             for call, ours in calls.items():
                 other = theirs[key][call]
                 counts["digest" if ours[0] == "digest" else f"raise:{ours[1]}"] += 1
-                recorded = seed_difference_holds(REFERENCE, seed, call, ours, other)
+                recorded = seed_difference_holds(REFERENCE, seed, call, ours, other, fresh and fresh[key][call])
                 if recorded is not None:
                     counts["expected difference"] += 1
                     if not recorded:
                         failures.append((seed, ["no longer differs as recorded"], key, call, ours, other, ""))
                     continue
-                if not same_outcome(ours, other, defective):
+                if not same_outcome(ours, other, observes_defect(case, call)):
                     failures.append((seed, sorted(case.tags), key, call, ours, other, str(case.schema)[:300]))
     summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
     print(f"harness seeds {start}..{start + count - 1}: {sum(counts.values())} calls compared ({summary})")
@@ -96,11 +103,14 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
         f"{len(failures)} calls differ in {len(seeds_failed)} seeds (first seeds {seeds_failed[:20]}):\n"
         + "\n".join(_report(f) for f in failures[:15])
     )
-    assert counts["digest"] > sum(counts.values()) // 3, f"most calls must hash, not raise: {summary}"
+    assert counts["digest"], f"no call hashed: {summary}"
+    if count >= 200:  # a targeted replay of a few seeds may hash little
+        assert counts["digest"] > sum(counts.values()) // 3, f"most calls must hash, not raise: {summary}"
     # The named cases behave exactly as recorded for this reference (listed in the pull request).
     wrong = []
     for name, build in NAMED_CASES.items():
-        wrong += named_case_holds(
-            REFERENCE, name, outcomes(ArrowDigester, build(), OPTION_SETS), worker["named_cases"][name]
-        )
+        case = build()
+        ours = outcomes(ArrowDigester, case, OPTION_SETS)
+        fresh = outcomes(ArrowDigester, fresh_case(case), OPTION_SETS) if needs_fresh(REFERENCE, name) else None
+        wrong += named_case_holds(REFERENCE, name, ours, worker["named_cases"][name], fresh)
     assert not wrong, f"a named case differs from its record for starfix-python {REFERENCE}:\n" + "\n".join(wrong[:10])

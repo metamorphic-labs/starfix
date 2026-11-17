@@ -114,7 +114,14 @@ jobs:
           SHARDS: ${{ inputs.shards || '[0, 1, 2, 3]' }}
           SHARD: ${{ matrix.shard }}
         run: |
-          COUNT=$(python -c "import json, os; print(int(os.environ['SEEDS']) // len(json.loads(os.environ['SHARDS'])))")
-          export STARFIX_HARNESS_SEEDS="$(( SHARD * COUNT )):${COUNT}"
+          # Cumulative boundaries: shard k of n gets seeds [k*S//n, (k+1)*S//n), so every seed is
+          # run once; the shard list must be exactly 0..n-1.
+          export STARFIX_HARNESS_SEEDS=$(python -c "
+          import json, os
+          seeds, shards, k = int(os.environ['SEEDS']), json.loads(os.environ['SHARDS']), int(os.environ['SHARD'])
+          n = len(shards)
+          assert sorted(shards) == list(range(n)), f'shards must be 0..{n - 1} once each, got {shards}'
+          start, end = k * seeds // n, (k + 1) * seeds // n
+          print(f'{start}:{end - start}')")
           echo "seeds ${STARFIX_HARNESS_SEEDS}"
           .venv-starfix/bin/python -m pytest python/tests/test_harness.py -ra -s

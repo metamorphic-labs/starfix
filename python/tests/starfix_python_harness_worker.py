@@ -13,6 +13,7 @@ import os
 import sys
 from importlib.metadata import version
 
+import pyarrow as pa
 import starfix
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I leaves the script's directory out
@@ -35,6 +36,7 @@ def main(manifest_path, results_path):
         json.dump(
             {
                 "starfix_version": version("starfix"),
+                "pyarrow_version": pa.__version__,
                 "generator_version": _harness.GENERATOR_VERSION,
                 "results": results,
                 "named_cases": named,
