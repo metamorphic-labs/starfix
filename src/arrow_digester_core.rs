@@ -16,7 +16,7 @@ use arrow::{
     },
     buffer::NullBuffer,
     compute::cast,
-    datatypes::{DataType, Schema},
+    datatypes::{DataType, Int64Type, Schema},
 };
 use arrow_schema::{Field, SchemaRef};
 use bitvec::prelude::*;
@@ -1091,6 +1091,11 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
 
     /// Resolve nested dictionary values without `cast`/`take`: rebuilding their children
     /// can validate nulls that a null list ancestor makes invisible (Section 7.4).
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "Invalid Arrow data (a visible key out of range) panics, as `cast` of a \
+                  dictionary of leaves does; refusals of valid input are returned"
+    )]
     fn traverse_nested_dictionary(
         array: &dyn Array,
         nullable: bool,
@@ -1100,21 +1105,28 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     ) -> Result<(), StarfixError> {
         let dictionary = array.as_any_dictionary();
         let values = dictionary.values();
-        // An empty dictionary can only have null keys; normalized_keys requires values.
-        let keys = if values.is_empty() {
-            vec![0; array.len()]
-        } else {
-            dictionary.normalized_keys()
-        };
+        // The keys as they are (`normalized_keys` would clamp an out-of-range key to the last
+        // value); a key that does not fit an `Int64` is null here, and refused below.
+        let key_array =
+            cast(dictionary.keys(), &DataType::Int64).expect("dictionary keys as Int64");
+        let keys = key_array.as_primitive::<Int64Type>();
         let mut null_value = None;
-        for (row, key) in keys.into_iter().enumerate() {
+        for row in 0..array.len() {
             // A row under a null enclosing struct is never read (Section 3.2): its key, which
             // pyarrow can leave out of range, is not looked up.
             let hidden = ancestor_struct_nulls.is_some_and(|nulls| nulls.is_null(row));
             let value = if hidden || dictionary.keys().is_null(row) {
                 Arc::clone(null_value.get_or_insert_with(|| new_null_array(values.data_type(), 1)))
             } else {
-                values.slice(key, 1)
+                // A visible key out of range is invalid Arrow data, refused as the decoding of
+                // a dictionary of leaves refuses it.
+                let index = keys
+                    .is_valid(row)
+                    .then(|| keys.value(row))
+                    .and_then(|key| usize::try_from(key).ok())
+                    .filter(|index| *index < values.len())
+                    .expect("a visible dictionary key is within the dictionary");
+                values.slice(index, 1)
             };
             let ancestor = ancestor_struct_nulls.map(|nulls| nulls.slice(row, 1));
             Self::traverse_and_update(

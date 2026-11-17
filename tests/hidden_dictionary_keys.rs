@@ -106,6 +106,34 @@ mod tests {
     }
 
     #[test]
+    fn a_visible_out_of_range_key_of_a_nested_dictionary_is_refused() {
+        // It was clamped to the last value and hashed (CodeRabbit on 3d2f47e).
+        let inner = Fields::from(vec![Field::new("v", DataType::Int32, true)]);
+        let values: ArrayRef = Arc::new(StructArray::new(
+            inner.clone(),
+            vec![Arc::new(Int32Array::from(vec![7, 8]))],
+            None,
+        ));
+        let value_type = DataType::Struct(inner);
+        for key in [2, 9, -1] {
+            let visible = batch(&value_type, &[0, key], &values, &[true, true]);
+            catch_unwind(AssertUnwindSafe(|| {
+                ArrowDigester::hash_record_batch(&visible, HasherConfig::default())
+            }))
+            .unwrap_err();
+        }
+        // In range, and hidden out of range, still hash.
+        ArrowDigester::hash_record_batch(
+            &batch(&value_type, &[0, 1], &values, &[true, true]),
+            HasherConfig::default(),
+        );
+        ArrowDigester::hash_record_batch(
+            &batch(&value_type, &[0, 9], &values, &[true, false]),
+            HasherConfig::default(),
+        );
+    }
+
+    #[test]
     fn a_visible_out_of_range_key_is_still_refused() {
         let values: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
         let visible = batch(&DataType::Utf8, &[0, 5], &values, &[false, true]);
