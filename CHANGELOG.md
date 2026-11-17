@@ -94,7 +94,8 @@ were wrong.** The hash format does not change (still 2).
 - CI builds the package and runs its tests, the differential test against starfix-python 0.5.0,
   and starfix-python's own test suite against it, on the newest pyarrow and on the floor
   (Python 3.10, pyarrow 14). `maturin-release.yml` builds and tests the wheels of every
-  platform; it publishes nothing.
+  platform; a release tag `v*` publishes them to TestPyPI, then PyPI, by trusted publishing
+  (ITL-1193).
 
 ### Changed
 
