@@ -261,7 +261,7 @@ def _hashes(schema: pa.Schema, batch: pa.RecordBatch, options: dict) -> dict[str
         "prepared.hash_table": outcome(lambda: prepared.hash_table(table)),
         "stream": outcome(lambda: streamed(ArrowDigester(schema, **options))),
         "prepared.digester": outcome(lambda: streamed(prepared.digester())),
-        "hash_array": [ArrowDigester.hash_array(column, **array_options) for column in batch.columns],
+        "hash_array": [outcome(lambda c=c: ArrowDigester.hash_array(c, **array_options)) for c in batch.columns],
     }
 
 
