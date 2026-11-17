@@ -4,7 +4,7 @@
 //!
 //! Each group hashes many inputs and folds every outcome (the hash, or "panicked") into one
 //! SHA-256 digest, so the two implementations can be compared without linking them into one
-//! binary (both crates export the same uniffi symbols).
+//! binary (when the reference was generated, both crates exported the same uniffi symbols).
 
 #![expect(clippy::unwrap_used, reason = "Okay in test")]
 

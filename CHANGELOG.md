@@ -16,9 +16,9 @@
   an equal schema (about 0.05 µs) and analyses only a schema that differs.
 - `prepare` succeeds whenever `hash_schema` does; for a schema whose data cannot be hashed,
   `hash_record_batch` and `digester` panic as `ArrowDigester::new` does.
-- Python binding (`python/starfix`): `prepare(...)`, `ArrowDigester.prepare(...)` and
-  `PreparedSchema` (`schema_digest`, `hash_record_batch`, `hash_table`, `digester`), with the
-  three options as keywords.
+- Python package (`python/starfix`): `ArrowDigester.prepare(...)` and `PreparedSchema`
+  (`schema_digest`, `hash_record_batch`, `hash_table`, `digester`), with the three options as
+  keywords (starfix-python's interface; see the ITL-1178 section below).
 - `examples/prepared_bench.rs`: time per one-row hash, one-shot and prepared.
 
 ### Added — a `Result` API (ITL-1178)
@@ -26,42 +26,60 @@
 - `StarfixError`, and `try_*` variants that return it instead of panicking:
   `ArrowDigester::try_new`, `try_update`, `try_hash_schema`, `try_hash_record_batch`,
   `try_hash_array_with_config`, and `PreparedSchema::try_new`, `try_hash_record_batch`,
-  `try_digester`. Every refusal of the spec (Sections 5, 7 and 8) is a variant. The panicking
-  methods are unchanged and panic with the error's message.
+  `try_digester`. Every refusal of the spec (Sections 5, 7 and 8) is a variant, with the node
+  path where there is one. The panicking methods are unchanged and panic with the error's
+  message.
 - `update` is atomic: a refused batch (for example a null in a non-nullable field, found while
   the batch is traversed) leaves the digester as it was, so it can be used further. Before, its
   state was unspecified. The state is saved per node, not per row.
+- `ArrowDigester::hash_array_chunks` / `try_hash_array_chunks`: the hash of the concatenation
+  of several arrays of one type (the chunks of a column), without concatenating them.
 
-### Fixed — the Python binding of this crate (`python/starfix`, ITL-1178)
+### Fixed — dictionary keys under a null struct (ITL-1178)
 
-**Hashes produced through this binding change with this release for multi-chunk tables, and
-with schema-level metadata, because they were wrong.** The hash format does not change (still
-2): the binding now gives the digester the data the Rust crate and starfix-python hash. This is
-the binding built from this repository with maturin, not starfix-python.
+- A dictionary key under a null enclosing struct is never hashed (spec Section 3.2), but it was
+  decoded, and an out-of-range one panicked. pyarrow builds such keys (an all-null struct over a
+  dictionary child gets key 0 into an empty dictionary). They are no longer read: such data
+  hashes as starfix-python hashes it. No hash of valid data changes.
 
-- Every chunk of a table is hashed. `hash_record_batch(table)` and `PyArrowDigester.update(table)`
-  hashed the first chunk only: a multi-chunk table hashed differently from the same rows in one
-  chunk, and two tables that differ after their first chunk had the same hash. A table now
-  hashes like the same rows in one record batch, as in the Rust crate and starfix-python.
-- An empty table (no record batches) hashes, to the hash of a zero-row batch of its schema. It
-  raised `IndexError`.
-- The schema-level metadata of a record batch reaches the digester. The import dropped it, so
-  the metadata a schema carries was missing from what the digester received (in 0.5.0 the
-  options could not be set, so it showed when hashing with `include_metadata`).
-- The options `include_metadata`, `ordered_columns` and `ordered_struct_fields` (keyword-only,
-  default `False`) are available on `hash_schema`, `hash_record_batch` and `PyArrowDigester`;
-  only the defaults were exposed.
-- `ArrowDigester` has starfix-python's interface: `ArrowDigester(schema, *, ...)` with `update`
-  and `finalize`, and `prepare`, `hash_schema`, `hash_record_batch`, `hash_table` and
-  `hash_array` (a `ChunkedArray` hashes as its chunks combined), with the same option names and
-  defaults. Rejected input raises `ValueError` (it raised the binding's internal error) and a
-  wrong container type `TypeError`. The differences that remain are listed in the package
-  docstring (after a rejected `update` the digester cannot be used; starfix-python restores it).
-- Two inputs pyarrow exports failed to import: a struct inside a sliced struct or fixed-size
-  list (arrow-rs applied the slice offset twice), and buffers less aligned than arrow-rs requires
-  (such as `decimal128` values at an 8-byte boundary, as read from IPC), which are now copied.
-- CI builds the binding and runs its tests, including a differential test against starfix-python
-  0.5.0 (golden vectors and seeded random multi-chunk tables, all 8 option combinations).
+### Changed — the Python package (`python/starfix`, ITL-1178)
+
+The Python package built from this crate is rebuilt on PyO3 (it used uniffi) and takes
+starfix-python's interface, so that it can replace starfix-python. **Hashes produced through
+the 0.5.0 binding change for multi-chunk tables, and with schema-level metadata, because they
+were wrong.** The hash format does not change (still 2).
+
+- Fixed: every chunk of a table is hashed. The 0.5.0 binding's `hash_record_batch(table)` and
+  `PyArrowDigester.update(table)` hashed the first chunk only, so a multi-chunk table hashed
+  differently from the same rows in one chunk, and two tables that differ after their first
+  chunk had the same hash. An empty table hashes as a zero-row batch (it raised `IndexError`).
+  Schema-level metadata of a record batch reaches the digester (the import dropped it; in 0.5.0
+  the options could not be set, so it showed only through the prepared schema).
+- Interface: `ArrowDigester(schema, *, include_metadata=False, ordered_columns=False,
+  ordered_struct_fields=False)` with `update` and `finalize`; `ArrowDigester.prepare`,
+  `hash_schema`, `hash_record_batch`, `hash_table`, `hash_array` (an Array or ChunkedArray);
+  `PreparedSchema` (`schema`, the three option properties, `schema_digest`,
+  `hash_record_batch`, `hash_table`, `digester`; immutable, picklable); `__version__`. Results,
+  exception types and messages are starfix-python's: refusals raise `ValueError` (also for
+  invalid Arrow data, never `PanicException`), a wrong container type `TypeError`; repeated
+  metadata keys are refused with `include_metadata`. **Breaking** for users of the 0.5.0
+  binding: `PyArrowDigester` and the module-level `hash_schema`, `hash_record_batch` and
+  `prepare` are removed (use `ArrowDigester`).
+- `starfix.legacy.v0_4` (format 1) is starfix-python's frozen pure-Python module, shipped
+  unchanged.
+- Arrow data crosses through the Arrow PyCapsule interface (pyarrow >= 14; arrow-rs's `pyarrow`
+  feature for schemas and arrays). Two inputs pyarrow exports that arrow-rs's import refused or
+  mishandled are handled: a struct nested in a sliced struct or fixed-size list (arrow-rs
+  applies the offset twice), and buffers less aligned than arrow-rs requires (copied).
+- The GIL is released while batches and arrays are hashed. Wheels are abi3 (Python >= 3.10).
+- uniffi, its bindgen binary and `uniffi.toml` are removed (Python was their only consumer).
+  PyO3 is an optional dependency (feature `python`): the Rust crate does not depend on it.
+- Runtime dependencies: `pyarrow>=14` only (`ipykernel` and `maturin` were listed as runtime
+  dependencies).
+- CI builds the package and runs its tests, the differential test against starfix-python 0.5.0,
+  and starfix-python's own test suite against it, on the newest pyarrow and on the floor
+  (Python 3.10, pyarrow 14). `maturin-release.yml` builds and tests the wheels of every
+  platform; it publishes nothing.
 
 ### Changed
 

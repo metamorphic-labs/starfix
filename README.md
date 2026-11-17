@@ -11,10 +11,10 @@ hashes, up to SHA-256 collisions (tested exhaustively on small inputs of every s
 Every hash is 35 bytes: a 3-byte **hash format version** followed by a SHA-256 digest. This crate
 produces **hash format 2** (`00 00 02`). The exact bytes are specified in
 [`docs/byte-layout-spec.md`](docs/byte-layout-spec.md), precisely enough for an independent
-implementation. [starfix-python](https://github.com/nauticalab/starfix-python) is being updated
-to format 2 in a companion change (its released versions produce format 1); its format-2
-implementation must match the Rust-generated golden vectors in `tests/golden/format2_v0.5.json`
-exactly.
+implementation. [starfix-python](https://github.com/nauticalab/starfix-python) is such an
+implementation in pure Python; it matches the Rust-generated golden vectors in
+`tests/golden/format2_v0.5.json` exactly. This repository also builds a Python package from the
+crate (see [Python](#python)).
 
 ## Usage
 
@@ -71,6 +71,48 @@ below) only `schema_digest` is available.
 Time per hash of a one-row, four-column batch (`cargo run --release --example prepared_bench`):
 one-shot `hash_record_batch` about 12 µs (about 25 µs in 0.5.0, which analysed the schema three
 times per call); `prepared.hash_record_batch` about 3 µs.
+
+## Python
+
+`python/starfix` is a Python package built from this crate with maturin and PyO3 (feature
+`python`): the hashing runs in Rust, with starfix-python's interface and results, so it can
+replace starfix-python.
+
+```python
+import pyarrow as pa
+from starfix import ArrowDigester
+
+table = pa.table({"id": [1, 2], "name": ["a", None]})
+ArrowDigester.hash_table(table)                        # every chunk of the table
+ArrowDigester.hash_record_batch(table.to_batches()[0])
+ArrowDigester.hash_schema(table.schema, include_metadata=True)
+ArrowDigester.hash_array(table.column("id"))           # an Array or a ChunkedArray
+
+prepared = ArrowDigester.prepare(table.schema)         # analyse the schema once
+prepared.hash_table(table)                             # == ArrowDigester.hash_table(table)
+
+digester = ArrowDigester(table.schema, ordered_columns=True)
+for batch in table.to_batches():
+    digester.update(batch)
+digester.finalize()
+```
+
+Same names, keyword-only options, defaults, results and exception types as starfix-python:
+refusals raise `ValueError` (with starfix-python's messages), a wrong container type `TypeError`.
+A refused `update` leaves the digester unchanged. Hashing releases the GIL. Arrow data crosses
+through the Arrow PyCapsule interface (pyarrow >= 14); wheels are abi3 (Python >= 3.10).
+`starfix.legacy.v0_4` (format 1, starfix-python 0.4) is starfix-python's frozen pure-Python
+module, shipped unchanged: it is not backed by the crate.
+
+Differences from starfix-python:
+
+- Invalid Arrow data that must be read (for example a dictionary key out of range in a visible
+  row) raises `ValueError` ("Invalid Arrow data: ..."); starfix-python raises whatever pyarrow
+  or Python raises there. A key under a null struct is never read, by either.
+- `PreparedSchema` accepts a batch whose schema equals the prepared one by a structural
+  comparison (arrow-rs schema equality), starfix-python by comparing IPC bytes; both then fall
+  back to the same schema-key comparison, so they accept and refuse the same batches.
+- Its private helpers (`starfix._format2`) do not exist.
 
 ## What is hashed
 
@@ -201,19 +243,24 @@ Regenerate the golden file (append-only) with `cargo run --bin emit_golden_forma
 `tests/golden_vectors_format2.rs` also requires a minimum vector and relation count, so a
 regeneration that drops vectors fails even if the generator was edited too.
 
-### The Python binding (`python/starfix`)
+### The Python package (`python/starfix`)
 
-The binding built from this repository with maturin (not starfix-python) has its own tests in
-`python/tests`: the golden vectors through every call, tables in several chunks, slices and
-empty tables, and `test_differential.py`, which compares every result with starfix-python
-under all 8 option combinations. Both packages import as `starfix`, so starfix-python runs in a
-separate environment named by `STARFIX_PYTHON` (the test is skipped without it):
+`python/tests` holds the package's own tests (the golden vectors through every call, tables in
+several chunks, slices and empty tables, metadata, errors) and `test_differential.py`, which
+compares every result with starfix-python 0.5.0 under all 8 option combinations. Both packages
+import as `starfix`, so starfix-python runs in its own environment, named by `STARFIX_PYTHON`
+(the test is skipped without it). `python/tests/parity` runs starfix-python's own test suite
+against this package (tests of starfix-python's private helpers are skipped, with the reason):
 
 ```sh
-maturin develop --skip-install        # builds python/starfix/_internal in place
+maturin develop --skip-install        # builds python/starfix/_internal*.so in place
 python -m venv /tmp/sfp && /tmp/sfp/bin/pip install pyarrow \
   && /tmp/sfp/bin/pip install --no-deps --require-hashes -r python/tests/starfix-python-requirements.txt
 STARFIX_PYTHON=/tmp/sfp/bin/python PYTHONPATH=python python -m pytest python/tests
+# starfix-python's suite, from a checkout of nauticalab/starfix-python:
+PYTHONPATH=$OLDPWD/python:$OLDPWD/python/tests/parity python -m pytest -p starfix_python_private_stub tests
 ```
 
-CI runs the same against a built wheel (`.github/workflows/ci.yml`, job `python-binding`).
+CI runs these against a built wheel (`.github/workflows/ci.yml`, job `python-binding`, also on
+Python 3.10 with pyarrow 14), and `.github/workflows/maturin-release.yml` builds and tests the
+wheels of every platform (it publishes nothing).
