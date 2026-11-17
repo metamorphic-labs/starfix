@@ -99,8 +99,8 @@ jobs:
     # The release tier (50,000 seeds, sharded) runs nightly and before publishing.
     uses: ./.github/workflows/differential-harness.yml
     with:
-      seeds: 2000
-      shards: '[0]'
+      seeds: 50000  # TEMPORARY: a second release-tier run (reverted by the next commit)
+      shards: '[0, 1, 2, 3]'
 
   verify-version-tag-sync:
     runs-on: ubuntu-latest
