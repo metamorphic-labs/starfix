@@ -19,7 +19,7 @@ use arrow::{
     compute::cast,
     datatypes::{DataType, Schema},
 };
-use arrow_schema::Field;
+use arrow_schema::{Field, SchemaRef};
 use bitvec::prelude::*;
 use digest::Digest;
 
@@ -161,16 +161,135 @@ fn normalize_schema(schema: &Schema) -> Schema {
     }
 }
 
+/// The result of the schema analysis (ITL-1177): everything that depends only on the schema
+/// and the options, computed once and shared, never modified, by every digester started from it.
+///
+/// Holds no cache and no global state: it is owned by whoever created it (a `PreparedSchema`,
+/// or a single digester).
+pub struct SchemaAnalysis<D: Digest> {
+    /// The analysed schema.
+    schema: SchemaRef,
+    config: HasherConfig,
+    /// The schema digest without the version prefix (byte-layout spec Section 2.5).
+    schema_digest: Vec<u8>,
+    /// Phase 1 canonical JSON, then `|` and the Phase 2 document when metadata is included and
+    /// present: equal keys iff equal schema digests under `config` (byte-layout spec Section 5).
+    schema_equality_key: String,
+    /// One empty entry per node, in node-path order (byte-layout spec Section 3).
+    entries_template: BTreeMap<String, DigestBufferType<D>>,
+    /// The first type whose data cannot be hashed, if any (byte-layout spec Section 8).
+    unsupported_data_type: Option<DataType>,
+}
+
+impl<D: Digest + Clone> SchemaAnalysis<D> {
+    /// Analyse `schema` under `config`: validate it (Section 7), compute the schema digest and
+    /// the equality key, check type support (Section 8; reported by `assert_data_supported`) and
+    /// lay out the node entries. Every step runs once.
+    ///
+    /// # Panics
+    /// As `ArrowDigester::hash_schema`.
+    pub fn new(schema: SchemaRef, config: HasherConfig) -> Self {
+        // Section 7 first, then the schema texts and digest (as `hash_schema`)
+        ArrowDigesterCore::<D>::validate_schema_paths(&schema);
+        let normalized = normalize_schema(&schema);
+        let (phase1, phase2) = ArrowDigesterCore::<D>::phase_texts(&normalized, config);
+        let schema_digest =
+            ArrowDigesterCore::<D>::schema_digest_of(&phase1, phase2.as_deref(), config);
+        let schema_equality_key = ArrowDigesterCore::<D>::equality_key(phase1, phase2);
+
+        // Find a data type whose data cannot be hashed: the schema digest exists, but no data
+        // of this schema can be hashed (`assert_data_supported`).
+        let unsupported_data_type = normalized
+            .fields
+            .iter()
+            .find_map(|field| ArrowDigesterCore::<D>::unsupported_data_type(field.data_type()));
+
+        // Flatten all nested fields into a single map for per-field hashing
+        let mut entries_template = BTreeMap::new();
+        for field in &normalized.fields {
+            ArrowDigesterCore::<D>::extract_fields_name(field, &mut entries_template);
+        }
+
+        Self {
+            schema,
+            config,
+            schema_digest,
+            schema_equality_key,
+            entries_template,
+            unsupported_data_type,
+        }
+    }
+
+    /// Reject a schema whose data cannot be hashed (byte-layout spec Section 8), before any data
+    /// is hashed: the rejection of `ArrowDigester::new`, found once by the analysis.
+    ///
+    /// # Panics
+    /// On `Null`, `Map`, `Interval`, view and other unsupported types anywhere in the schema.
+    pub fn assert_data_supported(&self) {
+        if let Some(other) = &self.unsupported_data_type {
+            todo!("hashing data of type {other} is not supported")
+        }
+    }
+
+    pub const fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub const fn config(&self) -> HasherConfig {
+        self.config
+    }
+
+    /// The schema digest without the version prefix.
+    pub fn schema_digest(&self) -> &[u8] {
+        &self.schema_digest
+    }
+
+    /// Whether a batch with schema `rb_schema` may be hashed with this analysis: the per-batch
+    /// schema check of byte-layout spec Section 5 (equal Phase 1 JSON under the options, equal
+    /// Phase 2 document with `include_metadata`, and Section 7).
+    ///
+    /// Checked in tiers, the first two being sufficient conditions that cost no allocation:
+    /// 1. the same schema object (`Arc::ptr_eq`);
+    /// 2. an equal schema (arrow-rs structural equality: names, complete data types,
+    ///    nullability, order, field metadata at every depth and schema metadata); the key is a
+    ///    function of the schema, so equal schemas have equal keys, and the analysed schema has
+    ///    passed Section 7;
+    /// 3. otherwise the batch schema's key is built and compared, and Section 7 is checked.
+    ///
+    /// # Panics
+    /// When tier 3 finds that the batch's schema fails Section 7.
+    pub fn matches(&self, rb_schema: &SchemaRef) -> bool {
+        if Arc::ptr_eq(rb_schema, &self.schema) || **rb_schema == *self.schema {
+            return true;
+        }
+        let config = self.config;
+        // Without metadata, `canonical_schema_json` normalizes types internally via
+        // `data_type_to_value`, so the schema need not be normalized first.
+        let matches = if config.include_metadata {
+            let (phase1, phase2) =
+                ArrowDigesterCore::<D>::phase_texts(&normalize_schema(rb_schema), config);
+            ArrowDigesterCore::<D>::equality_key(phase1, phase2) == self.schema_equality_key
+        } else {
+            ArrowDigesterCore::<D>::canonical_schema_json(rb_schema, config)
+                == self.schema_equality_key
+        };
+        if matches {
+            // An unordered top level is keyed by name, so a batch with duplicate column names
+            // can match the key; reject it like the analysed schema.
+            ArrowDigesterCore::<D>::validate_schema_paths(rb_schema);
+        }
+        matches
+    }
+}
+
 #[derive(Clone)]
 pub struct ArrowDigesterCore<D: Digest> {
-    schema_digest: Vec<u8>,
-    schema_equality_key: String,
+    analysis: Arc<SchemaAnalysis<D>>,
     fields_digest_buffer: BTreeMap<String, DigestBufferType<D>>,
-    config: HasherConfig,
     row_count: u64,
 }
 
-impl<D: Digest> ArrowDigesterCore<D> {
+impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// Test shim: v0.4.0 constructor taking only `include_metadata`.
     #[cfg(test)]
     pub fn new(schema: &Schema, include_metadata: bool) -> Self {
@@ -185,73 +304,46 @@ impl<D: Digest> ArrowDigesterCore<D> {
 
     /// Create a new instance of `ArrowDigesterCore` with the schema, which will be enforced through each update.
     pub fn new_with_config(schema: &Schema, config: HasherConfig) -> Self {
-        // Normalize the schema to canonical large types (metadata is preserved by normalize_schema)
-        let normalized = normalize_schema(schema);
-
-        // Hash the schema — hash_schema normalizes internally, so passing the original here is equivalent
-        let schema_digest = Self::hash_schema_with_config(schema, config);
-
-        // Build the equality key used in update() to enforce schema identity
-        let schema_equality_key = Self::build_schema_equality_key(&normalized, config);
-
-        // Reject data types whose data cannot be hashed, before any state exists
-        for field in &normalized.fields {
-            Self::validate_data_type(field.data_type());
-        }
-
-        // Flatten all nested fields into a single map for per-field hashing
-        let mut fields_digest_buffer = BTreeMap::new();
-        for field in &normalized.fields {
-            Self::extract_fields_name(field, &mut fields_digest_buffer);
-        }
-
-        Self {
-            schema_digest,
-            schema_equality_key,
-            fields_digest_buffer,
+        Self::from_analysis(Arc::new(SchemaAnalysis::new(
+            Arc::new(schema.clone()),
             config,
+        )))
+    }
+
+    /// A fresh digester of an existing analysis: no schema work.
+    ///
+    /// # Panics
+    /// When the schema's data cannot be hashed (`SchemaAnalysis::assert_data_supported`).
+    pub fn from_analysis(analysis: Arc<SchemaAnalysis<D>>) -> Self {
+        analysis.assert_data_supported();
+        Self {
+            fields_digest_buffer: analysis.entries_template.clone(),
+            analysis,
             row_count: 0,
         }
     }
 
     /// Hash a record batch and update the internal digests.
+    ///
+    /// # Panics
+    /// When the batch's schema does not match (byte-layout spec Section 5), and as
+    /// `update_matched`.
     pub fn update(&mut self, record_batch: &RecordBatch) {
-        let rb_schema = record_batch.schema();
+        assert!(
+            self.analysis.matches(record_batch.schema_ref()),
+            "Record batch schema does not match ArrowDigester schema"
+        );
+        self.update_matched(record_batch);
+    }
 
-        // Fast path (include_metadata = false): serialized_schema normalizes types internally
-        // via data_type_to_value, so normalize_schema is not needed and we can compare
-        // directly — avoiding the allocation of a normalized Schema/Fields/Arc<Field> tree.
-        //
-        // Metadata path (include_metadata = true): normalize first (normalize_schema preserves
-        // metadata), then build the full equality key that includes the metadata JSON.
-        let flags = option_flags(self.config);
-        if self.config.include_metadata {
-            let rb_normalized = normalize_schema(&rb_schema);
-            let rb_equality_key = Self::build_schema_equality_key(&rb_normalized, self.config);
-            assert!(
-                rb_equality_key == self.schema_equality_key,
-                "Record batch schema does not match ArrowDigester schema"
-            );
-        } else if flags == 0 {
-            assert!(
-                Self::serialized_schema(&rb_schema) == self.schema_equality_key,
-                "Record batch schema does not match ArrowDigester schema"
-            );
-        } else {
-            assert!(
-                Self::canonical_schema_json(&rb_schema, self.config) == self.schema_equality_key,
-                "Record batch schema does not match ArrowDigester schema"
-            );
-        }
-        // An unordered top level is keyed by name, so a batch with duplicate column names
-        // can match the digester's key; reject it like the digester's own schema.
-        Self::validate_schema_paths(&rb_schema);
+    /// `update` for a batch whose schema the caller has already matched against the analysis.
+    pub fn update_matched(&mut self, record_batch: &RecordBatch) {
         self.row_count = self
             .row_count
             .checked_add(record_batch.num_rows() as u64)
             .expect("row count overflow");
 
-        let schema = record_batch.schema();
+        let schema = record_batch.schema_ref();
         for col_idx in 0..record_batch.num_columns() {
             let field = schema.field(col_idx);
             let array = record_batch.column(col_idx);
@@ -335,7 +427,10 @@ impl<D: Digest> ArrowDigesterCore<D> {
 
     /// Hash a record batch directly without needing to create an `ArrowDigester` instance on the user side.
     pub fn hash_record_batch(record_batch: &RecordBatch, config: HasherConfig) -> Vec<u8> {
-        let mut digester = Self::new_with_config(record_batch.schema().as_ref(), config);
+        // The analysis is of the batch's own schema object: the check in `update` is the
+        // pointer comparison, so the schema is analysed once.
+        let mut digester =
+            Self::from_analysis(Arc::new(SchemaAnalysis::new(record_batch.schema(), config)));
         digester.update(record_batch);
         digester.finalize()
     }
@@ -347,8 +442,11 @@ impl<D: Digest> ArrowDigesterCore<D> {
         let mut final_digest = D::new();
 
         // header, the schema digest, then the number of rows
-        final_digest.update(header(KIND_RECORD_BATCH, option_flags(self.config)));
-        final_digest.update(&self.schema_digest);
+        final_digest.update(header(
+            KIND_RECORD_BATCH,
+            option_flags(self.analysis.config),
+        ));
+        final_digest.update(&self.analysis.schema_digest);
         final_digest.update(self.row_count.to_le_bytes());
 
         // Then digest each field digest in order
@@ -530,23 +628,48 @@ impl<D: Digest> ArrowDigesterCore<D> {
     /// Hash the schema in two phases.
     ///
     /// Phase 1 (always): canonical JSON of field names, data types, nullability (byte-layout spec Section 2.2).
-    /// Phase 2 (when `include_metadata` is `true`): per-field and schema-level metadata fed into the
-    /// same hasher via `update_metadata_hash`. Phase 2 adds nothing when all metadata maps are empty,
-    /// preserving the empty-metadata invariant.
+    /// Phase 2 (when `include_metadata` is `true`): per-field and schema-level metadata
+    /// (`metadata_document`), fed into the same hasher. Phase 2 adds nothing when all metadata
+    /// maps are empty, preserving the empty-metadata invariant.
     ///
     /// `normalize_schema` preserves metadata, so the normalized schema is used for both phases.
     pub fn hash_schema_with_config(schema: &Schema, config: HasherConfig) -> Vec<u8> {
-        let include_metadata = config.include_metadata;
-        let flags = option_flags(config);
         Self::validate_schema_paths(schema);
-        let normalized = normalize_schema(schema);
+        let (phase1, phase2) = Self::phase_texts(&normalize_schema(schema), config);
+        Self::schema_digest_of(&phase1, phase2.as_deref(), config)
+    }
+
+    /// The Phase 1 canonical schema JSON and, with `include_metadata`, the Phase 2 metadata
+    /// document (`None` when there is no metadata anywhere), of a normalized schema.
+    fn phase_texts(normalized: &Schema, config: HasherConfig) -> (String, Option<String>) {
+        let phase1 = Self::canonical_schema_json(normalized, config);
+        let phase2 = if config.include_metadata {
+            Self::metadata_document(normalized)
+        } else {
+            None
+        };
+        (phase1, phase2)
+    }
+
+    /// The schema digest (without the version prefix) of the two phase texts.
+    fn schema_digest_of(phase1: &str, phase2: Option<&str>, config: HasherConfig) -> Vec<u8> {
         let mut hasher = D::new();
-        hasher.update(header(KIND_SCHEMA, flags));
-        hasher.update(Self::canonical_schema_json(&normalized, config));
-        if include_metadata {
-            Self::update_metadata_hash(&mut hasher, &normalized);
+        hasher.update(header(KIND_SCHEMA, option_flags(config)));
+        hasher.update(phase1);
+        if let Some(metadata) = phase2 {
+            hasher.update(metadata.as_bytes());
         }
         hasher.finalize().to_vec()
+    }
+
+    /// The key compared by the per-batch schema check: the Phase 1 JSON, then `|` and the
+    /// Phase 2 document when there is one. The `|` separator is unambiguous because JSON never
+    /// ends with `|`. Equal keys iff equal schema digests under the same options.
+    fn equality_key(phase1: String, phase2: Option<String>) -> String {
+        match phase2 {
+            Some(metadata) => format!("{phase1}|{metadata}"),
+            None => phase1,
+        }
     }
 
     /// Recursively collect per-field metadata from a field and all its nested children.
@@ -632,30 +755,29 @@ impl<D: Digest> ArrowDigesterCore<D> {
         }
     }
 
-    /// Feed per-field and schema-level metadata into `hasher` for Phase 2 of schema hashing.
+    /// The Phase 2 metadata document of a normalized schema (byte-layout spec Section 2.3), or
+    /// `None` when no field and not the schema has metadata (the empty-metadata invariant).
     ///
     /// All fields are visited recursively (struct children, list/map element fields, etc.) so
     /// that metadata on nested fields is included. Field paths use
     /// [`DELIMITER_FOR_NESTED_FIELD`] as a separator (e.g. `"parent/child"`). Metadata keys
     /// within each map are sorted via `BTreeMap` to guarantee determinism regardless of
-    /// `HashMap` iteration order. Nothing is written when all metadata maps are empty,
-    /// preserving the empty-metadata invariant.
+    /// `HashMap` iteration order.
     ///
-    /// The entire Phase 2 contribution is serialized as a **single JSON object** and fed into
-    /// the hasher in one update. JSON is self-delimiting, so no length prefixes are needed:
+    /// The entire Phase 2 contribution is a **single JSON object**, fed into the hasher in one
+    /// update. JSON is self-delimiting, so no length prefixes are needed:
     ///
     /// ```text
-    /// hasher.update(serde_json::to_string({
+    /// {
     ///     "fields": { "<path>": { "<key>": "<value>", ... }, ... },  // present when any field has metadata
     ///     "schema": { "<key>": "<value>", ... },                     // present when schema has metadata
-    /// }))
+    /// }
     /// ```
     ///
     /// Keys within each metadata map are sorted (via `BTreeMap`). Field paths are sorted
     /// alphabetically (via `BTreeMap`). The top-level keys `"fields"` and `"schema"` are
-    /// fixed, so `"fields"` always sorts before `"schema"`. Nothing is written when both
-    /// `"fields"` and `"schema"` would be absent.
-    fn update_metadata_hash(hasher: &mut D, schema: &Schema) {
+    /// fixed, so `"fields"` always sorts before `"schema"`.
+    fn metadata_document(schema: &Schema) -> Option<String> {
         // Collect metadata from all fields recursively (BTreeMap gives deterministic order).
         let mut all_field_meta: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for field in schema.fields() {
@@ -680,64 +802,10 @@ impl<D: Digest> ArrowDigesterCore<D> {
             );
         }
 
-        if !meta_doc.is_empty() {
-            let json = serde_json::to_string(&meta_doc)
-                .expect("Failed to serialize metadata doc to JSON string");
-            hasher.update(json.as_bytes());
-        }
-    }
-
-    /// Build a canonical string key for schema identity enforcement in `update()`.
-    ///
-    /// When `include_metadata` is `false`, or when the schema has no metadata anywhere
-    /// (including nested fields), returns the structure-only JSON (Phase 1) — preserving
-    /// the empty-metadata invariant.
-    ///
-    /// When `include_metadata` is `true` and metadata is present, appends `|` followed by the
-    /// same JSON object format used in `update_metadata_hash`:
-    /// `{"fields": {...}, "schema": {...}}`. The `|` separator is unambiguous because JSON
-    /// objects never end with `|`.
-    fn build_schema_equality_key(normalized: &Schema, config: HasherConfig) -> String {
-        let structure = Self::canonical_schema_json(normalized, config);
-        if !config.include_metadata {
-            return structure;
-        }
-
-        // Collect all field metadata recursively (includes nested fields).
-        let mut field_meta: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        for field in normalized.fields() {
-            field_meta.extend(Self::collect_nested_field_metadata(field, field.name()));
-        }
-
-        let has_any_metadata = !normalized.metadata().is_empty() || !field_meta.is_empty();
-        if !has_any_metadata {
-            return structure;
-        }
-
-        // Mirror the same BTreeMap structure used in update_metadata_hash so the equality
-        // key reflects exactly what was hashed.
-        let mut meta_doc: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-        if !field_meta.is_empty() {
-            meta_doc.insert(
-                "fields",
-                serde_json::to_value(&field_meta)
-                    .expect("Failed to serialize field metadata to JSON value"),
-            );
-        }
-        if !normalized.metadata().is_empty() {
-            let sorted_schema_meta: BTreeMap<&String, &String> =
-                normalized.metadata().iter().collect();
-            meta_doc.insert(
-                "schema",
-                serde_json::to_value(&sorted_schema_meta)
-                    .expect("Failed to serialize schema metadata to JSON value"),
-            );
-        }
-
-        let meta_json = serde_json::to_string(&meta_doc)
-            .expect("Failed to serialize metadata equality key to JSON string");
-
-        format!("{structure}|{meta_json}")
+        (!meta_doc.is_empty()).then(|| {
+            serde_json::to_string(&meta_doc)
+                .expect("Failed to serialize metadata doc to JSON string")
+        })
     }
 
     /// Top-down recursive traversal that routes data to `BTreeMap` entries.
@@ -1374,14 +1442,19 @@ impl<D: Digest> ArrowDigesterCore<D> {
     /// # Panics
     /// On `Null`, `Map`, `Interval`, view and other unsupported types anywhere in the type tree.
     fn validate_data_type(data_type: &DataType) {
+        if let Some(other) = Self::unsupported_data_type(data_type) {
+            todo!("hashing data of type {other} is not supported")
+        }
+    }
+
+    /// The first type in the type tree whose data cannot be hashed (normalized), if any.
+    fn unsupported_data_type(data_type: &DataType) -> Option<DataType> {
         match normalize_data_type(data_type) {
-            DataType::Struct(children) => {
-                for child in &children {
-                    Self::validate_data_type(child.data_type());
-                }
-            }
+            DataType::Struct(children) => children
+                .iter()
+                .find_map(|child| Self::unsupported_data_type(child.data_type())),
             DataType::LargeList(element) | DataType::FixedSizeList(element, _) => {
-                Self::validate_data_type(element.data_type());
+                Self::unsupported_data_type(element.data_type())
             }
             DataType::Boolean
             | DataType::Int8
@@ -1407,8 +1480,8 @@ impl<D: Digest> ArrowDigesterCore<D> {
             | DataType::Decimal256(_, _)
             | DataType::FixedSizeBinary(_)
             | DataType::LargeBinary
-            | DataType::LargeUtf8 => {}
-            other => todo!("hashing data of type {other} is not supported"),
+            | DataType::LargeUtf8 => None,
+            other => Some(other),
         }
     }
 

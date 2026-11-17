@@ -39,6 +39,39 @@ let array_hash_ordered = ArrowDigester::hash_array_with_config(
 );
 ```
 
+### Many batches of one schema: `prepare`
+
+Analysing the schema (validation, canonical schema JSON, schema digest, node layout) is a large
+part of hashing a small batch. To hash many batches of one schema, prepare the schema once and
+hash with the prepared object; the hashes are byte-identical to the one-shot calls:
+
+```rust
+use starfix::{ArrowDigester, HasherConfig, PreparedSchema};
+
+let prepared: PreparedSchema = ArrowDigester::prepare(&schema, HasherConfig::default());
+let schema_hash = prepared.schema_digest();       // == ArrowDigester::hash_schema(&schema, config)
+for batch in &batches {
+    let hash = prepared.hash_record_batch(batch); // == ArrowDigester::hash_record_batch(batch, config)
+}
+let mut digester = prepared.digester();           // == ArrowDigester::new(&schema, config)
+```
+
+The prepared object is immutable, cheap to clone and owned by the caller: starfix keeps no
+cache. A batch whose schema is not the prepared one under the prepared options is refused
+(panic "Record batch schema does not match the prepared schema"), by the rule of the streaming
+digester (byte-layout spec Section 5): the batch's schema must have the prepared schema digest
+under the options (names, canonical types, nullability, column and struct-field order when
+ordered, all field, extension and schema metadata with `include_metadata`) and pass the checks
+of Section 7. The check is a pointer comparison when the batch is built on `prepared.schema()`
+and an allocation-free structural comparison for an equal schema; only a schema that differs is
+analysed to decide (canonically equal types such as `Utf8` and `LargeUtf8` are accepted).
+`prepare` succeeds whenever `hash_schema` does; for a schema whose data cannot be hashed (see
+below) only `schema_digest` is available.
+
+Time per hash of a one-row, four-column batch (`cargo run --release --example prepared_bench`):
+one-shot `hash_record_batch` about 12 µs (about 25 µs in 0.5.0, which analysed the schema three
+times per call); `prepared.hash_record_batch` about 3 µs.
+
 ## What is hashed
 
 - **The schema**: column names, canonical types (`Utf8`≡`LargeUtf8`, `Binary`≡`LargeBinary`,

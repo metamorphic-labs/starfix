@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Added — prepared schema (ITL-1177)
+
+- `ArrowDigester::prepare(&schema, config)` / `PreparedSchema::new`: analyse a schema once and
+  hash many record batches of it (`hash_record_batch`), take its schema digest
+  (`schema_digest`) or start streaming digesters (`digester`) without analysing it again. The
+  object is immutable and owned by the caller; starfix keeps no cache. Every hash is
+  byte-identical to the one-shot calls (tested over every golden vector under all 8 option
+  combinations, the leaf and nested-type sweeps, and every pair of golden schemas).
+- A batch whose schema is not the prepared one under the prepared options is refused (panic
+  "Record batch schema does not match the prepared schema"), by the streaming digester's rule
+  (byte-layout spec Section 5). The check is a pointer or structural comparison for the same or
+  an equal schema (about 0.05 µs) and analyses only a schema that differs.
+- `prepare` succeeds whenever `hash_schema` does; for a schema whose data cannot be hashed,
+  `hash_record_batch` and `digester` panic as `ArrowDigester::new` does.
+- Python binding (`python/starfix`): `prepare(...)`, `ArrowDigester.prepare(...)` and
+  `PreparedSchema` (`schema_digest`, `hash_record_batch`, `hash_table`, `digester`), with the
+  three options as keywords.
+- `examples/prepared_bench.rs`: time per one-row hash, one-shot and prepared.
+
+### Changed
+
+- The schema is analysed once per one-shot call: `hash_record_batch` and `ArrowDigester::new`
+  built the canonical schema JSON three times and the metadata document twice. One-row
+  `hash_record_batch` takes about half the time (about 25 µs to about 12 µs in the benchmark).
+  No hash changes; the hash format is still 2.
+
 ## 0.5.0 (2026-11-11)
 
 ### Changed — hash format 2 (every hash changes)
