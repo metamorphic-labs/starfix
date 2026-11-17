@@ -18,6 +18,7 @@ from _parity_cases import (
     NESTED_LISTS,
     POINT_NAME,
     POINT_SERIALIZED,
+    BinaryPoint,
     Point,
     bufferless_empty,
     bufferless_nested,
@@ -355,6 +356,8 @@ DICTIONARY_OF_POINT = dictionary_of_point_batches()
 
 @pytest.mark.parametrize("case", sorted(DICTIONARY_OF_POINT))
 def test_a_dictionary_of_an_extension_type_hashes_its_extension_metadata(case):
+    if case == "binary-serialization":
+        pytest.skip("refused with include_metadata: test_a_serialization_that_is_not_utf8_is_refused")
     # The extension's keys are exported on the dictionary's value type, and were lost on import:
     # with include_metadata the field hashed as a dictionary of the storage type.
     batch = DICTIONARY_OF_POINT[case]
@@ -384,3 +387,20 @@ def _dictionary_of_storage(field: pa.Field) -> pa.Field:
     elif pa.types.is_struct(t):
         t = pa.struct([_dictionary_of_storage(child) for child in t])
     return field.with_type(t)
+
+
+def test_a_serialization_that_is_not_utf8_is_refused_with_include_metadata():
+    # Also in a dictionary, whose value node carries it (it was decoded leniently there).
+    batch = DICTIONARY_OF_POINT["binary-serialization"]
+    storage = pa.array([{"x": 1}, {"x": 2}], BinaryPoint().storage_type)
+    top = pa.RecordBatch.from_arrays([pa.ExtensionArray.from_storage(BinaryPoint(), storage)], names=["p"])
+    for each in (batch, top):
+        ArrowDigester.hash_record_batch(each)  # not read without the option
+        for call in (
+            lambda: ArrowDigester.hash_schema(each.schema, include_metadata=True),
+            lambda: ArrowDigester.prepare(each.schema, include_metadata=True),
+            lambda: ArrowDigester.hash_record_batch(each, include_metadata=True),
+            lambda: ArrowDigester.hash_table(pa.Table.from_batches([each]), include_metadata=True),
+        ):
+            with pytest.raises(UnicodeDecodeError):
+                call()
