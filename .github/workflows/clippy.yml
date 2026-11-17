@@ -17,5 +17,7 @@ jobs:
           components: rustfmt, clippy
       - name: Run syntax and style tests
         run: cargo clippy --all-targets -- -D warnings
+      - name: Run syntax and style tests of the Python binding (feature python)
+        run: cargo clippy --all-targets --features python -- -D warnings
       - name: Run format test
         run: cargo fmt --check

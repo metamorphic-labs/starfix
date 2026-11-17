@@ -340,6 +340,16 @@ digester's flags must be equal, and with `include_metadata` its Phase 2 document
 batch with reordered columns is accepted without `ordered_columns` and rejected with it, and
 the same for struct fields and `ordered_struct_fields`. Physically different but canonically
 equal types (`Utf8` vs `LargeUtf8`, dictionary vs plain, `List` vs `LargeList`) are accepted.
+Equivalently: a batch is accepted iff its schema has the digester's schema digest (Section 2.5)
+under the digester's options and it passes Section 7.
+
+The same check applies to a **prepared schema** (Rust `ArrowDigester::prepare` /
+`PreparedSchema`; Python `ArrowDigester.prepare`): the schema is analysed once, and each batch
+or table hashed with it must pass this check (Rust panics with "Record batch schema does not
+match the prepared schema"). An accepted batch hashes exactly as the one-shot call. An
+implementation may decide acceptance by a cheaper test that implies it (the same schema object,
+or a structural equality that compares everything this check reads); it must never accept a
+batch this check rejects.
 
 ---
 

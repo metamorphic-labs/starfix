@@ -1,20 +1,27 @@
 [build-system]
-requires = ["maturin>=1.9.6"]
+requires = ["maturin>=1.9.6,<2"]
 build-backend = "maturin"
 
 [project]
 name = "starfix"
-classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-]
 dynamic = ["version"]
-description = "Library for logical hashing of structured data"
+description = "Deterministic logical hashing of Apache Arrow data (schemas, record batches, tables, arrays)"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["ipykernel>=7.1.0", "maturin>=1.9.6", "pyarrow>=22.0.0"]
+license = "MIT OR Apache-2.0"
+keywords = ["arrow", "hashing"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = ["pyarrow>=14"]
 
+[project.urls]
+Repository = "https://github.com/metamorphic-labs/starfix"
 
 [tool.maturin]
-python-source = "python"          # if you have additional Python code
-module-name = "starfix._internal" # the Rust extension module
+bindings = "pyo3"
+features = ["python", "pyo3/extension-module"]
+python-source = "python"
+module-name = "starfix._internal"

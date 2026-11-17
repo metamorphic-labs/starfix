@@ -28,22 +28,20 @@ postcard = "1.1.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
-# automated CFFI + bindings in other languages
-uniffi = { version = "0.30.0", features = ["cli", "tokio"] }
+# The Python extension module (feature `python`, built by maturin; see pyproject.toml). The
+# version is the one arrow's `pyarrow` feature is built against.
+pyo3 = { version = "0.26", optional = true, features = ["abi3-py310"] }
+
+[features]
+# The Python binding (python/starfix): PyO3 and the Arrow PyCapsule interchange of arrow-rs.
+python = ["dep:pyo3", "arrow/pyarrow"]
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 
 
 [[bin]]
-name = "uniffi-bindgen"
-
-[[bin]]
 name = "emit_golden_format2"
-
-[build-dependencies]
-uniffi = { version = "0.29.4", features = ["build"] }
-
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -78,7 +76,7 @@ missing_inline_in_public_items = { level = "allow", priority = 127 }    # let ru
 missing_trait_methods = { level = "allow", priority = 127 }             # allow in favor of rustc `implement the missing item`
 module_name_repetitions = { level = "allow", priority = 127 }           # allow use of module name in type names
 multiple_crate_versions = { level = "allow", priority = 127 }           # allow since list of exceptions changes frequently from external
-multiple_inherent_impl = { level = "allow", priority = 127 }            # required in best practice to limit exposure over UniFFI
+multiple_inherent_impl = { level = "allow", priority = 127 }            # allow several impl blocks per type (the Python binding adds its own)
 must_use_candidate = { level = "allow", priority = 127 }                # omitting #[must_use] ok
 mod_module_files = { level = "allow", priority = 127 }                  # mod directories ok
 non_ascii_literal = { level = "allow", priority = 127 }                 # non-ascii char in string literal ok
