@@ -29,7 +29,7 @@ import pyarrow as pa
 
 from _parity_cases import bufferless_empty
 
-GENERATOR_VERSION = 1
+GENERATOR_VERSION = 2
 
 
 class HarnessExtension(pa.ExtensionType):
@@ -81,6 +81,9 @@ class _Generator:
     def __init__(self, rng: random.Random):
         self.rng = rng
         self.tags: set[str] = set()
+        # At most one defect (invalid data) per case: with two, the implementations may report
+        # either one first, which is not a difference.
+        self.defect = False
 
     def chance(self, p: float) -> bool:
         return self.rng.random() < p
@@ -177,9 +180,10 @@ class _Generator:
     def validity(self, length: int, nullable: bool | None) -> tuple[list[bool], int]:
         """Row validity; `nullable` False sometimes gets a null anyway (refused by both), None
         never (map keys: pyarrow aborts on a null key)."""
-        if nullable is None or (not nullable and not self.chance(0.03)):
+        if nullable is None or (not nullable and (self.defect or not self.chance(0.03))):
             return [True] * length, 0
         if not nullable:
+            self.defect = True
             self.tags.add("null-in-non-nullable")
         valid = [not self.chance(0.25) for _ in range(length)]
         return valid, valid.count(False)
@@ -235,7 +239,8 @@ class _Generator:
         size = self.rng.randint(1, 4)
         dictionary = self.array(t.value_type, size, True)
         keys = [self.rng.randrange(size) if ok else None for ok in valid]
-        if invalid_key and length and self.chance(0.1):
+        if invalid_key and length and not self.defect and self.chance(0.1):
+            self.defect = True
             self.tags.add("invalid-dictionary-key")
             row = self.rng.randrange(length)
             keys[row] = size + 2  # visible and out of range: invalid data
@@ -375,8 +380,15 @@ def _calls(D, case: Case, table: pa.Table, options: dict) -> dict:
     return calls
 
 
-def same_outcome(ours: list, theirs: list) -> bool:
-    """Equal digests, or both raise in the same class (a crash never matches)."""
+DEFECTS = {"invalid-dictionary-key", "null-in-non-nullable"}
+
+
+def same_outcome(ours: list, theirs: list, defective: bool = False) -> bool:
+    """Equal digests, or both raise in the same class (a crash never matches). For a
+    `defective` input (invalid data, see DEFECTS) any two raises match: it may also hold a
+    refusal, and either may be reported first."""
     if ours[0] == "digest" or theirs[0] == "digest":
         return ours == theirs
-    return ours[1] == theirs[1] != "crash"
+    if "crash" in (ours[1], theirs[1]):
+        return False
+    return defective or ours[1] == theirs[1]
