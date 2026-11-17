@@ -136,11 +136,11 @@ jobs:
 
 # Publishing (not enabled; for the developer to decide and set up):
 #
-# The PyPI project "starfix" is currently published from nauticalab/starfix-python. To publish
-# these wheels instead, a PyPI owner of "starfix" adds a trusted publisher for this repository
-# (owner nauticalab, repository starfix, workflow maturin-release.yml, and a GitHub environment
-# such as "pypi"), and the developer adds a job here, run only for tags, that downloads the
-# artifacts above (actions/download-artifact) and uploads them with
+# The PyPI project "starfix" is currently published from metamorphic-labs/starfix-python. To
+# publish these wheels instead, a PyPI owner of "starfix" adds a trusted publisher for this
+# repository (owner metamorphic-labs, repository starfix, workflow maturin-release.yml, and a
+# GitHub environment such as "pypi"), and the developer adds a job here, run only for tags,
+# that downloads the artifacts above (actions/download-artifact) and uploads them with
 # pypa/gh-action-pypi-publish under `permissions: id-token: write` in that environment. The
 # trusted publisher of the other repository should then be removed. Version: maturin takes it
 # from Cargo.toml, which cargo-release bumps at release.

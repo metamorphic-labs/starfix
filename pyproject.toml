@@ -18,7 +18,7 @@ classifiers = [
 dependencies = ["pyarrow>=14"]
 
 [project.urls]
-Repository = "https://github.com/nauticalab/starfix"
+Repository = "https://github.com/metamorphic-labs/starfix"
 
 [tool.maturin]
 bindings = "pyo3"

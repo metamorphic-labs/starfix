@@ -11,7 +11,7 @@ hashes, up to SHA-256 collisions (tested exhaustively on small inputs of every s
 Every hash is 35 bytes: a 3-byte **hash format version** followed by a SHA-256 digest. This crate
 produces **hash format 2** (`00 00 02`). The exact bytes are specified in
 [`docs/byte-layout-spec.md`](docs/byte-layout-spec.md), precisely enough for an independent
-implementation. [starfix-python](https://github.com/nauticalab/starfix-python) is such an
+implementation. [starfix-python](https://github.com/metamorphic-labs/starfix-python) is such an
 implementation in pure Python; it matches the Rust-generated golden vectors in
 `tests/golden/format2_v0.5.json` exactly. This repository also builds a Python package from the
 crate (see [Python](#python)).
@@ -257,7 +257,7 @@ maturin develop --skip-install        # builds python/starfix/_internal*.so in p
 python -m venv /tmp/sfp && /tmp/sfp/bin/pip install pyarrow \
   && /tmp/sfp/bin/pip install --no-deps --require-hashes -r python/tests/starfix-python-requirements.txt
 STARFIX_PYTHON=/tmp/sfp/bin/python PYTHONPATH=python python -m pytest python/tests
-# starfix-python's suite, from a checkout of nauticalab/starfix-python:
+# starfix-python's suite, from a checkout of metamorphic-labs/starfix-python:
 PYTHONPATH=$OLDPWD/python:$OLDPWD/python/tests/parity python -m pytest -p starfix_python_private_stub tests
 ```
 

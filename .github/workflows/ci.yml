@@ -47,14 +47,14 @@ jobs:
             pyarrow: '14.0.2'
             parity: false
     env:
-      # starfix-python's ITL-1177 branch (nauticalab/starfix-python PR #13); move with it.
+      # starfix-python's ITL-1177 branch (metamorphic-labs/starfix-python PR #13); move with it.
       STARFIX_PYTHON_COMMIT: 576d23bce7c2fa94216b7cabe095e2823a5c74fb
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       if: matrix.parity
       with:
-        repository: nauticalab/starfix-python
+        repository: metamorphic-labs/starfix-python
         ref: ${{ env.STARFIX_PYTHON_COMMIT }}
         path: starfix-python
         persist-credentials: false
