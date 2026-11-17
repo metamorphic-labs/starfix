@@ -323,6 +323,76 @@ def build_case(seed: int) -> Case:
     return _Generator(random.Random(f"starfix-harness-{GENERATOR_VERSION}-{seed}")).case(seed)
 
 
+# --- expected differences (named, with the reason; listed in the pull request) ------------
+
+
+@dataclass
+class ExpectedDifference:
+    """An input on which the binding hashes the `differing` calls where starfix-python 0.5.0
+    raises `theirs` (a class of `classify`); every other call gives equal digests. No 0.5.0
+    digest differs (it gives none for those calls). A change on either side fails
+    `test_harness`."""
+
+    reason: str
+    build: object  # () -> Case
+    theirs: str
+    differing: frozenset  # call names without the [index]
+
+
+def _empty_array_of_an_invalid_dictionary() -> Case:
+    inner_type = pa.dictionary(pa.int8(), pa.string())
+    inner_keys = pa.array([0, 1, 6], pa.int8()).buffers()[1]  # 6: out of range
+    inner = pa.DictionaryArray.from_buffers(inner_type, 3, [None, inner_keys], pa.array(["a", "b"]))
+    values = pa.ExtensionArray.from_storage(HarnessExtension(inner_type), inner)
+    column = pa.DictionaryArray.from_arrays(pa.array([], pa.int16()), values)
+    batch = pa.RecordBatch.from_arrays([column], names=["d"])
+    return Case(-1, batch.schema, [batch], {"expected-difference"})
+
+
+def _empty_dictionary_without_offsets_buffer() -> Case:
+    dictionary = bufferless_empty(pa.string())
+    column = pa.DictionaryArray.from_arrays(pa.array([None, None], pa.int32()), dictionary)
+    batch = pa.RecordBatch.from_arrays([column], names=["d"])
+    return Case(-2, batch.schema, [batch], {"expected-difference"})
+
+
+EXPECTED_DIFFERENCES = {
+    "empty-array-of-an-invalid-dictionary": ExpectedDifference(
+        "Zero rows of a dictionary whose dictionary is invalid (an inner out-of-range key): the "
+        "binding reads no row and hashes the empty array; 0.5.0 decodes the dictionary and raises "
+        "ArrowIndexError in a stream, hash_record_batch and hash_array, while its own hash_table "
+        "gives the binding's digest. The input is invalid Arrow (validate(full=True) fails).",
+        _empty_array_of_an_invalid_dictionary,
+        "invalid-data",
+        frozenset({"stream", "hash_record_batch", "hash_array"}),
+    ),
+    "empty-dictionary-without-offsets-buffer": ExpectedDifference(
+        "A dictionary whose empty dictionary has no offsets buffer (valid Arrow; every key null): "
+        "the binding hashes it as with an allocated buffer; 0.5.0 fails with TypeError "
+        "(memoryview of None).",
+        _empty_dictionary_without_offsets_buffer,
+        "type",
+        frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
+    ),
+}
+
+
+def expected_difference_holds(name: str, ours: dict, theirs: dict) -> list[str]:
+    """The calls of a named case that do not differ as recorded (empty when all do)."""
+    expected = EXPECTED_DIFFERENCES[name]
+    wrong = []
+    for key, calls in ours.items():
+        for call, outcome in calls.items():
+            other = theirs[key][call]
+            if call.split("[")[0] in expected.differing:
+                holds = outcome[0] == "digest" and other[0] == "raise" and other[1] == expected.theirs
+            else:
+                holds = outcome == other and outcome[0] == "digest"
+            if not holds:
+                wrong.append(f"{name} {key} {call}: ours {outcome} / starfix-python {other}")
+    return wrong
+
+
 # --- running and comparing ----------------------------------------------------------------
 
 

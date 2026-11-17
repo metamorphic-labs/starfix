@@ -12,7 +12,9 @@ its refusals may come first); a crash never matches.
 pull request and 50,000, in shards, before a release. Skipped when ``STARFIX_PYTHON`` is unset,
 unless ``STARFIX_REQUIRE_DIFFERENTIAL`` is set, where it fails instead.
 
-A failure names the seed; ``PYTHONPATH=python/tests python -c "import _harness;
+Two named differences are expected (``_harness.EXPECTED_DIFFERENCES``, with the reasons):
+invalid or unusual dictionaries where the binding hashes and 0.5.0 raises; no 0.5.0 digest
+differs. They are checked to hold exactly as recorded. A failure names the seed; ``PYTHONPATH=python/tests python -c "import _harness;
 print(_harness.build_case(SEED))"`` rebuilds the input, and each finding becomes a permanent,
 hand-reduced case in ``_parity_cases``.
 """
@@ -25,7 +27,15 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from _harness import DEFECTS, GENERATOR_VERSION, build_case, outcomes, same_outcome
+from _harness import (
+    DEFECTS,
+    EXPECTED_DIFFERENCES,
+    GENERATOR_VERSION,
+    build_case,
+    expected_difference_holds,
+    outcomes,
+    same_outcome,
+)
 from _support import OPTION_SETS
 from starfix import ArrowDigester
 from test_differential import STARFIX_PYTHON_VERSION, _starfix_python
@@ -74,3 +84,9 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
         + "\n".join(_report(f) for f in failures[:15])
     )
     assert counts["digest"] > sum(counts.values()) // 3, f"most calls must hash, not raise: {summary}"
+    # The named, expected differences (listed in the pull request) are exactly as recorded.
+    wrong = []
+    for name, difference in EXPECTED_DIFFERENCES.items():
+        ours = outcomes(ArrowDigester, difference.build(), OPTION_SETS)
+        wrong += expected_difference_holds(name, ours, worker["expected_differences"][name])
+    assert not wrong, "an expected difference changed:\n" + "\n".join(wrong[:10])
