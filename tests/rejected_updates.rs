@@ -69,6 +69,19 @@ mod tests {
         }
     }
 
+    /// One valid row of the schema with columns `b`, `a`, `d` (in that order).
+    fn reordered_batch(reordered: Schema) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(reordered),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["r0"])),
+                keys(&[0]),
+            ],
+        )
+        .unwrap()
+    }
+
     fn good(first: i64) -> RecordBatch {
         batch_of(schema(), &[Some(first), first.checked_add(1)], &[0, 1])
     }
@@ -98,7 +111,7 @@ mod tests {
             ),
             (
                 "column order (ordered_columns)",
-                batch_of(reordered, &[Some(1)], &[0]),
+                reordered_batch(reordered),
                 false,
             ),
             (

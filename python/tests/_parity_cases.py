@@ -165,6 +165,26 @@ def nul_name_batch(schema: pa.Schema, rows: list[dict]) -> pa.RecordBatch:
     return pa.RecordBatch.from_arrays(columns, schema=schema)
 
 
+# --- metadata that is not UTF-8 ------------------------------------------------------------
+
+
+def binary_metadata_cases() -> dict[str, pa.RecordBatch]:
+    """{case: a batch whose metadata (schema, field or nested field) is not UTF-8}."""
+    int_column = pa.array([1, 2])
+    nested = pa.struct([pa.field("x", pa.int64(), metadata={b"k\xfe": b"v"})])
+    return {
+        "schema": pa.RecordBatch.from_arrays(
+            [int_column], schema=pa.schema([("a", pa.int64())], metadata={b"blob": b"\xff"})
+        ),
+        "field": pa.RecordBatch.from_arrays(
+            [int_column], schema=pa.schema([pa.field("a", pa.int64(), metadata={b"blob": b"\xff\x00"})])
+        ),
+        "nested-field": pa.RecordBatch.from_arrays(
+            [pa.array([{"x": 1}, None], nested)], schema=pa.schema([pa.field("s", nested)])
+        ),
+    }
+
+
 # --- the differential's in-process cases --------------------------------------------------
 
 
@@ -194,6 +214,8 @@ def differential_cases() -> dict[str, tuple[pa.Schema, list[pa.RecordBatch]]]:
             nested_dictionary_schema(depth),
             [],
         )
+    for case_id, batch in binary_metadata_cases().items():
+        cases[f"binary-metadata:{case_id}"] = (batch.schema, [batch])
     for case_id, (schema, _, rows) in nul_name_cases().items():
         cases[f"nul-name:{case_id}"] = (schema, [nul_name_batch(schema, rows)] if rows else [])
     return cases

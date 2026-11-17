@@ -1,34 +1,37 @@
 //! The Python extension module `starfix._internal` (feature `python`, built by maturin).
 //!
 //! Arrow data crosses through the Arrow `PyCapsule` interface (`__arrow_c_schema__`,
-//! `__arrow_c_array__`): schemas through arrow-rs's `pyarrow` feature, arrays and record
-//! batches through their capsules directly (an empty node may omit the offsets buffer that
-//! arrow-rs requires, see [`fill_empty_offsets`]; arrow-rs's `RecordBatch` import applies a
-//! struct's offset twice for a struct nested in a sliced struct, see
-//! [`without_struct_offsets`]). The Python package (`python/starfix`) wraps these classes in
-//! starfix-python's interface; every table is fed one record batch at a time.
+//! `__arrow_c_array__`), read with arrow-rs's C Data Interface import after these repairs: an
+//! empty node may omit the offsets buffer that arrow-rs requires ([`fill_empty_offsets`]);
+//! metadata that is not hashed is cleared, as arrow-rs refuses metadata that is not UTF-8
+//! ([`exported_schema`]); names cut at a NUL are taken from pyarrow ([`with_full_names`]);
+//! arrow-rs's `RecordBatch` import applies a struct's offset twice for a struct nested in a
+//! sliced struct ([`without_struct_offsets`]). The Python package (`python/starfix`) wraps these
+//! classes in starfix-python's interface; every table is fed one record batch at a time.
 //!
-//! Refusals ([`StarfixError`]) raise `ValueError`. A panic of arrow-rs on invalid Arrow data is
-//! caught at the boundary and raised as `ValueError` too, never as `PanicException`. The GIL is
-//! released while a batch or array is hashed (not while it is imported: that reads Python
-//! objects).
+//! Refusals ([`StarfixError`]) raise `ValueError`. A panic of arrow-rs on invalid Arrow data,
+//! while it is imported or hashed, is caught and raised as `ValueError` too, never as
+//! `PanicException`. The GIL is released while a batch or array is hashed (not while it is
+//! imported: that reads Python objects).
 #![expect(
     unsafe_code,
     reason = "Reading Arrow C Data Interface structures from PyCapsules"
 )]
+use std::any::Any;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
-use std::{ptr, slice};
+use std::{ptr, slice, str};
 
 use arrow::array::{
-    make_array, Array, ArrayData, ArrayDataBuilder, RecordBatch, RecordBatchOptions, StructArray,
+    make_array, Array, ArrayData, ArrayDataBuilder, ArrayRef, RecordBatch, RecordBatchOptions,
+    StructArray,
 };
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use arrow::pyarrow::{FromPyArrow as _, PyArrowException, ToPyArrow as _};
+use arrow::pyarrow::{PyArrowException, ToPyArrow as _};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyTypeError, PyUnicodeDecodeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule, PyTuple};
 
@@ -109,15 +112,24 @@ fn hashing<T: Send>(
     f: impl FnOnce() -> Result<T, StarfixError> + Send,
 ) -> PyResult<T> {
     py.detach(|| catch_unwind(AssertUnwindSafe(f)))
-        .map_err(|payload| {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown error");
-            PyValueError::new_err(format!("Invalid Arrow data: {message}"))
-        })?
+        .map_err(|payload| invalid_data(payload.as_ref()))?
         .map_err(|error| value_error(py, &error))
+}
+
+/// Run an import step of Arrow data: a panic of arrow-rs on malformed data (a struct child
+/// shorter than the struct, say) becomes `ValueError`, as in [`hashing`].
+fn importing<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|payload| invalid_data(payload.as_ref()))?
+}
+
+/// The `ValueError` of a panic of arrow-rs on invalid Arrow data.
+fn invalid_data(payload: &(dyn Any + Send)) -> PyErr {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown error");
+    PyValueError::new_err(format!("Invalid Arrow data: {message}"))
 }
 
 /// The capsule `name` of `obj.method()` (a capsule or a pair of capsules, by position).
@@ -200,78 +212,133 @@ fn import_record_batch(
     full_names: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<RecordBatch> {
     let (schema_capsule, array_capsule) = array_capsules(batch)?;
-    // SAFETY:
-    // The capsule holds a valid `ArrowSchema` exported by its producer and stays alive (and
-    // owns it) until the end of this function.
-    let ffi_schema = unsafe { schema_capsule.reference::<FFI_ArrowSchema>() };
-    if include_metadata && check_metadata(ffi_schema)? {
+    let ffi_schema = exported_schema(&schema_capsule, include_metadata);
+    if include_metadata && check_metadata(batch.py(), ffi_schema)? {
         check_extension_metadata(&batch.getattr("schema")?)?;
     }
     let exported =
         Schema::try_from(ffi_schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let struct_type = DataType::Struct(exported.fields().clone());
-    let raw_data = take_array(&array_capsule, ffi_schema, &struct_type)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    if !matches!(raw_data.data_type(), DataType::Struct(_)) {
-        return Err(PyTypeError::new_err(
-            "expected a record batch (a struct array from __arrow_c_array__)",
-        ));
-    }
-    let (schema, array_data) = match full_names {
-        Some(py_schema) => {
-            let schema = with_full_names(&exported, py_schema)?;
-            let named = DataType::Struct(schema.fields().clone());
-            (schema, retyped(imported(raw_data), &named))
-        }
-        None => (exported, imported(raw_data)),
+    let schema = match full_names {
+        Some(py_schema) => with_full_names(&exported, py_schema)?,
+        None => exported.clone(),
     };
-    let num_rows = array_data.len();
-    let (_, columns, _) = StructArray::from(array_data).into_parts();
-    RecordBatch::try_new_with_options(
-        Arc::new(schema),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))
+    importing(|| {
+        let struct_type = DataType::Struct(exported.fields().clone());
+        let raw_data = take_array(&array_capsule, ffi_schema, &struct_type)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if !matches!(raw_data.data_type(), DataType::Struct(_)) {
+            return Err(PyTypeError::new_err(
+                "expected a record batch (a struct array from __arrow_c_array__)",
+            ));
+        }
+        let array_data = match full_names {
+            Some(_) => retyped(
+                imported(raw_data),
+                &DataType::Struct(schema.fields().clone()),
+            ),
+            None => imported(raw_data),
+        };
+        let num_rows = array_data.len();
+        let (_, columns, _) = StructArray::from(array_data).into_parts();
+        RecordBatch::try_new_with_options(
+            Arc::new(schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+    })
 }
 
 /// An array (`pa.Array`) from its `__arrow_c_array__` capsules, as arrow-rs's `pyarrow` feature
-/// imports it (an import error raises `pyarrow.ArrowException`), its empty nodes given offsets.
-/// With `full_type` (its `pyarrow.DataType`, when a name contains NUL), the field names are
-/// taken from it.
+/// imports it (an import error raises `pyarrow.ArrowException`), its empty nodes given offsets
+/// and its metadata (never hashed for an array) cleared. With `full_type` (its
+/// `pyarrow.DataType`, when a name contains NUL), the field names are taken from it.
 fn import_array(
     array: &Bound<'_, PyAny>,
     full_type: Option<&Bound<'_, PyAny>>,
-) -> PyResult<ArrayData> {
+) -> PyResult<ArrayRef> {
     let (schema_capsule, array_capsule) = array_capsules(array)?;
-    // SAFETY: as in `import_record_batch`.
-    let ffi_schema = unsafe { schema_capsule.reference::<FFI_ArrowSchema>() };
+    let ffi_schema = exported_schema(&schema_capsule, false);
     let arrow_error = |error: ArrowError| PyArrowException::new_err(error.to_string());
     let data_type = DataType::try_from(ffi_schema).map_err(arrow_error)?;
-    let data = imported(take_array(&array_capsule, ffi_schema, &data_type).map_err(arrow_error)?);
-    match full_type {
-        Some(py_type) => Ok(retyped(data, &with_full_type_names(&data_type, py_type)?)),
-        None => Ok(data),
+    let named = full_type
+        .map(|py_type| with_full_type_names(&data_type, py_type))
+        .transpose()?;
+    importing(|| {
+        let data =
+            imported(take_array(&array_capsule, ffi_schema, &data_type).map_err(arrow_error)?);
+        Ok(make_array(match &named {
+            Some(named_type) => retyped(data, named_type),
+            None => data,
+        }))
+    })
+}
+
+/// A type (`pa.DataType`) from its `__arrow_c_schema__` capsule, its metadata cleared.
+fn import_type(py_type: &Bound<'_, PyAny>) -> PyResult<DataType> {
+    let (capsule, _) = capsules(py_type, "__arrow_c_schema__")?;
+    check_capsule_name(&capsule, c"arrow_schema")?;
+    DataType::try_from(exported_schema(&capsule, false))
+        .map_err(|error| PyArrowException::new_err(error.to_string()))
+}
+
+/// The `ArrowSchema` of a schema capsule; with `keep_metadata` false, its metadata (at every
+/// node) is cleared first: arrow-rs decodes metadata as UTF-8 on import and refuses other bytes,
+/// which starfix-python accepts when metadata is not hashed. Only the export's pointers are
+/// cleared: the producer's release callback frees what the producer allocated.
+fn exported_schema<'py>(
+    capsule: &Bound<'py, PyCapsule>,
+    keep_metadata: bool,
+) -> &'py FFI_ArrowSchema {
+    if !keep_metadata {
+        // SAFETY:
+        // The capsule holds a valid `ArrowSchema` exported by its producer, alive as long as the
+        // capsule; nothing refers to it yet.
+        clear_metadata(unsafe { &mut *capsule.pointer().cast::<RawSchema>() });
+    }
+    // SAFETY: as above; the capsule outlives the reference.
+    unsafe { capsule.reference::<FFI_ArrowSchema>() }
+}
+
+/// Clear the metadata of `node` and of every node below it (children and dictionaries).
+fn clear_metadata(node: &mut RawSchema) {
+    node.metadata = ptr::null();
+    let count = usize::try_from(node.n_children).unwrap_or_default();
+    if !node.children.is_null() {
+        for i in 0..count {
+            // SAFETY: `children` points to `n_children` valid child pointers (C Data Interface).
+            let slot = unsafe { node.children.add(i) };
+            // SAFETY: as above, `slot` is in bounds.
+            let child = unsafe { *slot };
+            if !child.is_null() {
+                // SAFETY: each child pointer is a valid `ArrowSchema` owned by the parent.
+                clear_metadata(unsafe { &mut *child });
+            }
+        }
+    }
+    if !node.dictionary.is_null() {
+        // SAFETY: a non-null `dictionary` is the valid value-type schema (C Data Interface).
+        clear_metadata(unsafe { &mut *node.dictionary });
     }
 }
 
-/// A schema through arrow-rs's `pyarrow` feature, metadata included. With `include_metadata`,
-/// metadata that starfix-python refuses is refused first, as in [`import_record_batch`]. With
-/// `full_names` (the same schema, when a name contains NUL), the names are taken from pyarrow.
+/// A schema from its `__arrow_c_schema__` capsule, as arrow-rs's `pyarrow` feature imports it,
+/// metadata included only with `include_metadata`. Then metadata that starfix-python refuses
+/// is refused first, as in [`import_record_batch`]. With `full_names` (the same schema, when a
+/// name contains NUL), the names are taken from pyarrow.
 fn import_schema(
     schema: &Bound<'_, PyAny>,
     include_metadata: bool,
     full_names: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Schema> {
-    if include_metadata {
-        let (capsule, _) = capsules(schema, "__arrow_c_schema__")?;
-        check_capsule_name(&capsule, c"arrow_schema")?;
-        // SAFETY: as in `import_record_batch`; the capsule outlives the reference.
-        if check_metadata(unsafe { capsule.reference::<FFI_ArrowSchema>() })? {
-            check_extension_metadata(schema)?;
-        }
+    let (capsule, _) = capsules(schema, "__arrow_c_schema__")?;
+    check_capsule_name(&capsule, c"arrow_schema")?;
+    let ffi_schema = exported_schema(&capsule, include_metadata);
+    if include_metadata && check_metadata(schema.py(), ffi_schema)? {
+        check_extension_metadata(schema)?;
     }
-    let exported = Schema::from_pyarrow_bound(schema)?;
+    let exported = Schema::try_from(ffi_schema)
+        .map_err(|error| PyArrowException::new_err(error.to_string()))?;
     match full_names {
         Some(py_schema) => with_full_names(&exported, py_schema),
         None => Ok(exported),
@@ -612,9 +679,11 @@ const fn raw_schema(schema: &FFI_ArrowSchema) -> &RawSchema {
 /// Refuse metadata that repeats a key, on the schema or on any node (byte-layout spec Section
 /// 7, as starfix-python), with starfix-python's message. Returns whether a field node or a
 /// dictionary below one carries `ARROW:extension:name` (an extension type, or its metadata).
-fn check_metadata(schema: &FFI_ArrowSchema) -> PyResult<bool> {
+fn check_metadata(py: Python<'_>, schema: &FFI_ArrowSchema) -> PyResult<bool> {
     let root = raw_schema(schema);
-    if let Some(key) = repeated_key(&metadata_pairs(root)) {
+    let pairs = metadata_pairs(root);
+    check_utf8(py, &pairs)?;
+    if let Some(key) = repeated_key(&pairs) {
         return Err(PyValueError::new_err(format!(
             "Duplicate metadata key {} on the schema: ambiguous, rejected with include_metadata",
             py_repr(&key)
@@ -622,7 +691,7 @@ fn check_metadata(schema: &FFI_ArrowSchema) -> PyResult<bool> {
     }
     let mut extension = false;
     for child in children(root) {
-        extension |= check_node(child, &node_name(child))?;
+        extension |= check_node(py, child, &node_name(child))?;
     }
     Ok(extension)
 }
@@ -690,8 +759,9 @@ fn children(node: &RawSchema) -> impl Iterator<Item = &RawSchema> {
 /// The field node at `path` and its descendants (node paths of byte-layout spec Section 3.1;
 /// a dictionary, at any depth, is its value type; a map's entries struct is not a node).
 /// Returns whether any of them carries `ARROW:extension:name`.
-fn check_node(node: &RawSchema, path: &str) -> PyResult<bool> {
+fn check_node(py: Python<'_>, node: &RawSchema, path: &str) -> PyResult<bool> {
     let pairs = metadata_pairs(node);
+    check_utf8(py, &pairs)?;
     if let Some(key) = repeated_key(&pairs) {
         return Err(PyValueError::new_err(format!(
             "Field {}: Duplicate metadata key {} on the field: ambiguous, rejected with \
@@ -710,13 +780,13 @@ fn check_node(node: &RawSchema, path: &str) -> PyResult<bool> {
     match format_of(logical) {
         "+s" => {
             for child in children(logical) {
-                extension |= check_node(child, &format!("{path}/{}", node_name(child)))?;
+                extension |= check_node(py, child, &format!("{path}/{}", node_name(child)))?;
             }
         }
         "+m" => {
             for entries in children(logical) {
                 for (child, name) in children(entries).zip(["key", "value"]) {
-                    extension |= check_node(child, &format!("{path}//{name}"))?;
+                    extension |= check_node(py, child, &format!("{path}//{name}"))?;
                 }
             }
         }
@@ -724,7 +794,7 @@ fn check_node(node: &RawSchema, path: &str) -> PyResult<bool> {
             if format.starts_with("+l") || format.starts_with("+L") || format.starts_with("+w") =>
         {
             for child in children(logical) {
-                extension |= check_node(child, &format!("{path}/"))?;
+                extension |= check_node(py, child, &format!("{path}/"))?;
             }
         }
         _ => {}
@@ -755,6 +825,19 @@ fn metadata_pairs(node: &RawSchema) -> Vec<(Vec<u8>, Vec<u8>)> {
         pairs.push((key, value));
     }
     pairs
+}
+
+/// Refuse metadata that is not UTF-8 with the `UnicodeDecodeError` starfix-python raises when it
+/// decodes the metadata it hashes.
+fn check_utf8(py: Python<'_>, pairs: &[(Vec<u8>, Vec<u8>)]) -> PyResult<()> {
+    for text in pairs.iter().flat_map(|(key, value)| [key, value]) {
+        if let Err(error) = str::from_utf8(text) {
+            return Err(PyErr::from_value(
+                PyUnicodeDecodeError::new_utf8(py, text, error)?.into_any(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The first key that the pairs repeat.
@@ -887,14 +970,14 @@ fn hash_array<'py>(
     ordered_struct_fields: bool,
     full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let exported_type = DataType::from_pyarrow_bound(py_type)?;
+    let exported_type = import_type(py_type)?;
     let data_type = match full_names {
         Some(full_type) => with_full_type_names(&exported_type, full_type)?,
         None => exported_type,
     };
     let chunks = py_chunks
         .try_iter()?
-        .map(|chunk| Ok(make_array(import_array(&chunk?, full_names)?)))
+        .map(|chunk| import_array(&chunk?, full_names))
         .collect::<PyResult<Vec<_>>>()?;
     let config = config(false, ordered_columns, ordered_struct_fields);
     let digest = hashing(py, || {

@@ -10,6 +10,7 @@ Run after ``maturin develop``: ``pytest python/tests``.
 """
 
 import copy
+import ctypes
 import decimal
 import inspect
 import pickle
@@ -435,6 +436,61 @@ def test_invalid_arrow_data_raises_value_error():
         ArrowDigester.hash_array(invalid)
     with pytest.raises(ValueError, match="Invalid Arrow data"):
         ArrowDigester.hash_record_batch(pa.RecordBatch.from_arrays([invalid], names=["d"]))
+    # The same in a dictionary of a struct or of a list (it was clamped to the last value).
+    for value_type, values in [
+        (pa.struct([("x", pa.int64())]), [{"x": 1}]),
+        (pa.list_(pa.int64()), [[1]]),
+    ]:
+        nested = pa.DictionaryArray.from_buffers(
+            pa.dictionary(pa.int32(), value_type), 2, keys.buffers(), pa.array(values, value_type), offset=0
+        )
+        with pytest.raises(ValueError, match="Invalid Arrow data"):
+            ArrowDigester.hash_array(nested)
+        with pytest.raises(ValueError, match="Invalid Arrow data"):
+            ArrowDigester.hash_record_batch(pa.RecordBatch.from_arrays([nested], names=["d"]))
+
+
+class _ArrowArray(ctypes.Structure):
+    pass
+
+
+_ArrowArray._fields_ = [
+    ("length", ctypes.c_int64),
+    ("null_count", ctypes.c_int64),
+    ("offset", ctypes.c_int64),
+    ("n_buffers", ctypes.c_int64),
+    ("n_children", ctypes.c_int64),
+    ("buffers", ctypes.c_void_p),
+    ("children", ctypes.POINTER(ctypes.POINTER(_ArrowArray))),
+    ("dictionary", ctypes.c_void_p),
+    ("release", ctypes.c_void_p),
+    ("private_data", ctypes.c_void_p),
+]
+
+
+class _ShortColumn:
+    """A batch whose export claims its first column is empty: a column shorter than the batch,
+    which no pyarrow array is (the Arrow C Data Interface lets any producer send it)."""
+
+    def __init__(self, batch):
+        self.batch = batch
+
+    def __arrow_c_array__(self, requested_schema=None):
+        schema_capsule, array_capsule = self.batch.__arrow_c_array__()
+        get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+        get_pointer.restype = ctypes.c_void_p
+        get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        exported = _ArrowArray.from_address(get_pointer(array_capsule, b"arrow_array"))
+        exported.children[0].contents.length = 0
+        return schema_capsule, array_capsule
+
+
+def test_malformed_data_found_while_importing_raises_value_error():
+    # arrow-rs panics importing it (slicing the column to the batch's length); that was raised as
+    # PanicException, a BaseException.
+    batch = pa.RecordBatch.from_pydict({"a": [1, 2], "b": ["x", "y"]})
+    with pytest.raises(ValueError, match="Invalid Arrow data"):
+        starfix._internal.hash_record_batch(_ShortColumn(batch), False, False, False, None)
 
 
 # --- the GIL is released while hashing ------------------------------------------------------
