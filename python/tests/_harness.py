@@ -329,8 +329,8 @@ def build_case(seed: int) -> Case:
 @dataclass
 class ExpectedDifference:
     """An input on which the binding hashes the `differing` calls where starfix-python 0.5.0
-    raises `theirs` (a class of `classify`); every other call gives equal digests. No 0.5.0
-    digest differs (it gives none for those calls). A change on either side fails
+    raises `theirs` (a class of `classify`), or, with `theirs` "other-digest", gives another
+    digest; every other call gives equal digests. A change on either side fails
     `test_harness`."""
 
     reason: str
@@ -347,6 +347,15 @@ def _empty_array_of_an_invalid_dictionary() -> Case:
     column = pa.DictionaryArray.from_arrays(pa.array([], pa.int16()), values)
     batch = pa.RecordBatch.from_arrays([column], names=["d"])
     return Case(-1, batch.schema, [batch], {"expected-difference"})
+
+
+def _dictionary_over_a_sliced_nested_fixed_size_list() -> Case:
+    nested = pa.list_(pa.list_(pa.int64(), 1), 2)
+    values = pa.array([[[1], [2]], [[3], [4]], [[5], [6]]], nested).slice(1)
+    # Key 0 only: pyarrow's wrong take then reads row 2, inside the array (deterministic).
+    column = pa.DictionaryArray.from_arrays(pa.array([0], pa.int8()), values)
+    batch = pa.RecordBatch.from_arrays([column], names=["d"])
+    return Case(-3, batch.schema, [batch], {"expected-difference"})
 
 
 def _empty_dictionary_without_offsets_buffer() -> Case:
@@ -366,6 +375,16 @@ EXPECTED_DIFFERENCES = {
         "invalid-data",
         frozenset({"stream", "hash_record_batch", "hash_array"}),
     ),
+    "dictionary-over-a-sliced-nested-fixed-size-list": ExpectedDifference(
+        "pyarrow >= 17 take() (and filter()) returns wrong values for a sliced "
+        "fixed_size_list<fixed_size_list<...>>[n >= 2]; 0.5.0 decodes a dictionary of nested "
+        "values with take, so it hashes other values than the input's. The binding hashes the "
+        "input's values (equal to the same values built fresh, where both agree). Pending the "
+        "developer's decision (keep, option A).",
+        _dictionary_over_a_sliced_nested_fixed_size_list,
+        "other-digest",
+        frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
+    ),
     "empty-dictionary-without-offsets-buffer": ExpectedDifference(
         "A dictionary whose empty dictionary has no offsets buffer (valid Arrow; every key null): "
         "the binding hashes it as with an allocated buffer; 0.5.0 fails with TypeError "
@@ -377,6 +396,35 @@ EXPECTED_DIFFERENCES = {
 }
 
 
+def _differs_as(ours: list, theirs: list, kind: str) -> bool:
+    """The binding hashes; 0.5.0 raises `kind`, or ("other-digest") gives another digest."""
+    if ours[0] != "digest":
+        return False
+    if kind == "other-digest":
+        return theirs[0] == "digest" and theirs[1] != ours[1]
+    return theirs[0] == "raise" and theirs[1] == kind
+
+
+# Seeds of the generator (this GENERATOR_VERSION) whose recorded calls differ for a named
+# reason; their other calls are compared as usual.
+EXPECTED_SEED_DIFFERENCES = {
+    27714: (
+        "dictionary-over-a-sliced-nested-fixed-size-list",
+        "other-digest",
+        frozenset({"hash_table", "stream", "hash_record_batch[1]", "hash_array[1]"}),
+    ),
+}
+
+
+def seed_difference_holds(seed: int, key: str, call: str, ours: list, theirs: list) -> bool | None:
+    """For an allowlisted seed's recorded call: whether it still differs as recorded; None for
+    any other call (compared as usual)."""
+    if seed not in EXPECTED_SEED_DIFFERENCES:
+        return None
+    _, kind, calls = EXPECTED_SEED_DIFFERENCES[seed]
+    return _differs_as(ours, theirs, kind) if call in calls else None
+
+
 def expected_difference_holds(name: str, ours: dict, theirs: dict) -> list[str]:
     """The calls of a named case that do not differ as recorded (empty when all do)."""
     expected = EXPECTED_DIFFERENCES[name]
@@ -385,7 +433,7 @@ def expected_difference_holds(name: str, ours: dict, theirs: dict) -> list[str]:
         for call, outcome in calls.items():
             other = theirs[key][call]
             if call.split("[")[0] in expected.differing:
-                holds = outcome[0] == "digest" and other[0] == "raise" and other[1] == expected.theirs
+                holds = _differs_as(outcome, other, expected.theirs)
             else:
                 holds = outcome == other and outcome[0] == "digest"
             if not holds:

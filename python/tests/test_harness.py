@@ -12,9 +12,11 @@ its refusals may come first); a crash never matches.
 pull request and 50,000, in shards, before a release. Skipped when ``STARFIX_PYTHON`` is unset,
 unless ``STARFIX_REQUIRE_DIFFERENTIAL`` is set, where it fails instead.
 
-Two named differences are expected (``_harness.EXPECTED_DIFFERENCES``, with the reasons):
-invalid or unusual dictionaries where the binding hashes and 0.5.0 raises; no 0.5.0 digest
-differs. They are checked to hold exactly as recorded. A failure names the seed; ``PYTHONPATH=python/tests python -c "import _harness;
+Named differences are expected (``_harness.EXPECTED_DIFFERENCES``, with the reasons:
+unusual dictionaries where the binding hashes and 0.5.0 raises, and a pyarrow >= 17 take()
+bug that makes 0.5.0 hash other values than the input's), as are the recorded calls of
+allowlisted seeds (``EXPECTED_SEED_DIFFERENCES``). Both are checked to differ exactly as
+recorded, so a change on either side (or a pyarrow fix) is noticed. A failure names the seed; ``PYTHONPATH=python/tests python -c "import _harness;
 print(_harness.build_case(SEED))"`` rebuilds the input, and each finding becomes a permanent,
 hand-reduced case in ``_parity_cases``.
 """
@@ -34,6 +36,7 @@ from _harness import (
     build_case,
     expected_difference_holds,
     outcomes,
+    seed_difference_holds,
     same_outcome,
 )
 from _support import OPTION_SETS
@@ -74,6 +77,12 @@ def test_binding_equals_starfix_python_on_seeded_cases(tmp_path):
             for call, ours in calls.items():
                 other = theirs[key][call]
                 counts["digest" if ours[0] == "digest" else f"raise:{ours[1]}"] += 1
+                recorded = seed_difference_holds(seed, key, call, ours, other)
+                if recorded is not None:
+                    counts["expected difference"] += 1
+                    if not recorded:
+                        failures.append((seed, ["no longer differs as recorded"], key, call, ours, other, ""))
+                    continue
                 if not same_outcome(ours, other, defective):
                     failures.append((seed, sorted(case.tags), key, call, ours, other, str(case.schema)[:300]))
     summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
