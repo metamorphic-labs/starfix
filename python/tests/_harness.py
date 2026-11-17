@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import decimal
 import random
+import struct
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import pairwise
@@ -29,7 +30,7 @@ import pyarrow as pa
 
 from _parity_cases import bufferless_empty
 
-GENERATOR_VERSION = 2
+GENERATOR_VERSION = 3
 
 
 class HarnessExtension(pa.ExtensionType):
@@ -59,6 +60,7 @@ class Case:
     schema: pa.Schema
     batches: list[pa.RecordBatch]
     tags: set[str] = field(default_factory=set)
+    defect_columns: set[int] = field(default_factory=set)  # columns holding invalid data
 
 
 # --- types --------------------------------------------------------------------------------
@@ -74,7 +76,8 @@ def _leaf_types() -> list[pa.DataType]:
         pa.float32(), pa.float64(), pa.bool_(), pa.string(), pa.large_string(), pa.binary(), pa.large_binary(),
         pa.binary(3), pa.date32(), pa.date64(), pa.time32("s"), pa.time32("ms"), pa.time64("us"), pa.time64("ns"),
         pa.duration("s"), pa.duration("ns"), pa.decimal128(9, 2), pa.decimal128(30, 0), pa.decimal256(40, 5),
-    ]  # fmt: skip
+        pa.float16(),
+    ] + ([pa.decimal32(7, 2), pa.decimal64(15, 3)] if hasattr(pa, "decimal64") else [])  # fmt: skip
 
 
 class _Generator:
@@ -84,6 +87,8 @@ class _Generator:
         # At most one defect (invalid data) per case: with two, the implementations may report
         # either one first, which is not a difference.
         self.defect = False
+        self.column = 0  # the top-level column being built
+        self.defect_columns: set[int] = set()
 
     def chance(self, p: float) -> bool:
         return self.rng.random() < p
@@ -179,14 +184,19 @@ class _Generator:
 
     def validity(self, length: int, nullable: bool | None) -> tuple[list[bool], int]:
         """Row validity; `nullable` False sometimes gets a null anyway (refused by both), None
-        never (map keys: pyarrow aborts on a null key)."""
+        never (map keys: pyarrow aborts on a null key). Only a null actually drawn counts as
+        the case's defect."""
         if nullable is None or (not nullable and (self.defect or not self.chance(0.03))):
             return [True] * length, 0
-        if not nullable:
-            self.defect = True
-            self.tags.add("null-in-non-nullable")
         valid = [not self.chance(0.25) for _ in range(length)]
+        if not nullable and False in valid:
+            self.mark_defect("null-in-non-nullable")
         return valid, valid.count(False)
+
+    def mark_defect(self, tag: str) -> None:
+        self.defect = True
+        self.tags.add(tag)
+        self.defect_columns.add(self.column)
 
     def array(self, t: pa.DataType, length: int, nullable: bool | None = True, top: bool = False) -> pa.Array:
         """An array of `t`, sometimes a slice of a longer one (an offset at this depth). Only a
@@ -205,10 +215,13 @@ class _Generator:
         return self._array(t, length, nullable)
 
     def _array(self, t: pa.DataType, length: int, nullable: bool | None) -> pa.Array:
+        if isinstance(t, pa.BaseExtensionType):  # its validity is its storage's
+            return pa.ExtensionArray.from_storage(t, self.array(t.storage_type, length, nullable))
         valid, null_count = self.validity(length, nullable)
         validity = pa.array(valid, pa.bool_()).buffers()[1] if null_count else None
-        if isinstance(t, pa.BaseExtensionType):
-            return pa.ExtensionArray.from_storage(t, self.array(t.storage_type, length, nullable))
+        if pa.types.is_float16(t):  # pyarrow < 26 builds float16 only from NumPy values
+            data = struct.pack(f"<{length}e", *(self.value(t) if ok else 0.0 for ok in valid))
+            return pa.Array.from_buffers(t, length, [validity, pa.py_buffer(data)], null_count)
         if pa.types.is_dictionary(t):
             return self.dictionary_array(t, length, valid)
         if pa.types.is_struct(t):
@@ -240,8 +253,7 @@ class _Generator:
         dictionary = self.array(t.value_type, size, True)
         keys = [self.rng.randrange(size) if ok else None for ok in valid]
         if invalid_key and length and not self.defect and self.chance(0.1):
-            self.defect = True
-            self.tags.add("invalid-dictionary-key")
+            self.mark_defect("invalid-dictionary-key")
             row = self.rng.randrange(length)
             keys[row] = size + 2  # visible and out of range: invalid data
             indices = pa.array([0 if k is None else k for k in keys], t.index_type)
@@ -261,6 +273,8 @@ class _Generator:
                 (0, 2**bits - 1) if pa.types.is_unsigned_integer(t) else (-(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
             )
             return r.choice([low, high, 0, 1, r.randint(low, high)])
+        if pa.types.is_float16(t):
+            return r.choice([0.0, -0.0, 1.5, -2.25, 65504.0, 6.1e-5, float("inf"), float("-inf"), float("nan")])
         if pa.types.is_floating(t):
             return r.choice([0.0, -0.0, 1.5, -2.25, float("inf"), float("-inf"), float("nan"), r.uniform(-1e9, 1e9)])
         if pa.types.is_string(t) or pa.types.is_large_string(t):
@@ -293,7 +307,10 @@ class _Generator:
         fields = [self.field(0, name=name) for name in self.names(count)]
         schema = pa.schema(fields, metadata=self.metadata())
         rows = self.rng.choice([0, 1, 2, 3, 5, 9, 20])
-        columns = [self.array(f.type, rows, f.nullable, top=True) for f in fields]
+        columns = []
+        for i, f in enumerate(fields):
+            self.column = i
+            columns.append(self.array(f.type, rows, f.nullable, top=True))
         batch = pa.RecordBatch.from_arrays(columns, schema=schema)
         batches = []
         if rows or self.chance(0.7):
@@ -304,7 +321,7 @@ class _Generator:
                 self.tags.add("multi-chunk")
         else:
             self.tags.add("no-batches")
-        return Case(seed, schema, batches, self.tags)
+        return Case(seed, schema, batches, self.tags, self.defect_columns)
 
 
 def _bufferless_ok(t: pa.DataType) -> bool:
@@ -406,48 +423,82 @@ EXPECTED_DIFFERENCES = {
     },
 }
 
-# Seeds of the generator (this GENERATOR_VERSION) whose recorded calls differ, per reference,
-# for a named reason; their other calls are compared as usual.
+# Seeds of the generator whose recorded calls differ, per reference and GENERATOR_VERSION, for
+# a named reason; their other calls are compared as usual.
 EXPECTED_SEED_DIFFERENCES = {
     "0.5.0": {
-        27714: (
-            "dictionary-over-a-sliced-nested-fixed-size-list",
-            "other-digest",
-            frozenset({"hash_table", "stream", "hash_record_batch[1]", "hash_array[1]"}),
-        ),
+        GENERATOR_VERSION: {},
     },
 }
 
 
-def _differs_as(ours: list, theirs: list, kind: str) -> bool:
-    """The binding hashes; the reference raises `kind`, or ("other-digest") gives another digest."""
+def _differs_as(ours: list, theirs: list, kind: str, fresh: list) -> bool:
+    """The binding hashes; the reference raises `kind`, or ("other-digest") gives another digest
+    while the binding's equals its digest of the same values built fresh (`fresh`), so a
+    regression of the binding on such an input is still caught."""
     if ours[0] != "digest":
         return False
     if kind == "other-digest":
-        return theirs[0] == "digest" and theirs[1] != ours[1]
+        return theirs[0] == "digest" and theirs[1] != ours[1] and fresh == ours
     return theirs[0] == "raise" and theirs[1] == kind
 
 
-def seed_difference_holds(reference: str, seed: int, call: str, ours: list, theirs: list) -> bool | None:
-    """For an allowlisted seed's recorded call: whether it still differs as recorded; None for
-    any other call (compared as usual)."""
-    recorded = EXPECTED_SEED_DIFFERENCES.get(reference, {}).get(seed)
+def _fresh(array: pa.Array) -> pa.Array:
+    """The same values in a newly built array: no offsets, buffers allocated by pyarrow."""
+    if isinstance(array.type, pa.BaseExtensionType):
+        return pa.ExtensionArray.from_storage(array.type, _fresh(array.storage))
+    if pa.types.is_dictionary(array.type):
+        indices = pa.array(array.indices.to_pylist(), array.type.index_type)
+        return pa.DictionaryArray.from_arrays(indices, _fresh(array.dictionary))
+    return pa.array(array.to_pylist(), array.type)
+
+
+def fresh_case(case: Case) -> Case:
+    """`case` with every column rebuilt by `_fresh`, in the same batches."""
+    batches = [pa.RecordBatch.from_arrays([_fresh(c) for c in b.columns], schema=b.schema) for b in case.batches]
+    return Case(case.seed, case.schema, batches, case.tags, case.defect_columns)
+
+
+def seed_difference_holds(
+    reference: str, seed: int, call: str, ours: list, theirs: list, fresh: list | None
+) -> bool | None:
+    """For an allowlisted seed's recorded call: whether it still differs as recorded (`fresh`:
+    the binding's outcome on `fresh_case`); None for any other call (compared as usual)."""
+    recorded = EXPECTED_SEED_DIFFERENCES.get(reference, {}).get(GENERATOR_VERSION, {}).get(seed)
     if recorded is None:
         return None
     _, kind, calls = recorded
-    return _differs_as(ours, theirs, kind) if call in calls else None
+    return _differs_as(ours, theirs, kind, fresh) if call in calls else None
 
 
-def named_case_holds(reference: str, name: str, ours: dict, theirs: dict) -> list[str]:
+def allowlisted(reference: str, seed: int) -> bool:
+    return seed in EXPECTED_SEED_DIFFERENCES.get(reference, {}).get(GENERATOR_VERSION, {})
+
+
+def observes_defect(case: Case, call: str) -> bool:
+    """Whether a call reads the column holding the case's invalid data (schemas never do)."""
+    if call.startswith("hash_array["):
+        return int(call[len("hash_array[") : -1]) in case.defect_columns
+    return call != "hash_schema" and bool(case.defect_columns)
+
+
+def needs_fresh(reference: str, name: str) -> bool:
+    """Whether a named case's recorded difference is checked against its `fresh_case`."""
+    expected = EXPECTED_DIFFERENCES.get(reference, {}).get(name)
+    return expected is not None and expected.theirs == "other-digest"
+
+
+def named_case_holds(reference: str, name: str, ours: dict, theirs: dict, fresh: dict | None) -> list[str]:
     """The calls of a named case that do not behave as recorded for `reference` (empty when all
-    do): its recorded difference, or full agreement when none is recorded."""
+    do): its recorded difference, or full agreement when none is recorded. `fresh`: the
+    binding's outcomes on its `fresh_case`."""
     expected = EXPECTED_DIFFERENCES.get(reference, {}).get(name)
     wrong = []
     for key, calls in ours.items():
         for call, outcome in calls.items():
             other = theirs[key][call]
             if expected is not None and call.split("[")[0] in expected.differing:
-                holds = _differs_as(outcome, other, expected.theirs)
+                holds = _differs_as(outcome, other, expected.theirs, fresh and fresh[key][call])
             elif expected is not None:
                 holds = outcome == other and outcome[0] == "digest"
             else:
@@ -514,13 +565,10 @@ def _calls(D, case: Case, table: pa.Table, options: dict) -> dict:
     return calls
 
 
-DEFECTS = {"invalid-dictionary-key", "null-in-non-nullable"}
-
-
 def same_outcome(ours: list, theirs: list, defective: bool = False) -> bool:
     """Equal digests, or both raise in the same class (a crash never matches). For a
-    `defective` input (invalid data, see DEFECTS) any two raises match: it may also hold a
-    refusal, and either may be reported first."""
+    `defective` call (one that reads invalid data, see `observes_defect`) any two raises match:
+    the input may also hold a refusal, and either may be reported first."""
     if ours[0] == "digest" or theirs[0] == "digest":
         return ours == theirs
     if "crash" in (ours[1], theirs[1]):
