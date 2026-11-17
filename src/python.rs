@@ -378,15 +378,24 @@ fn with_dictionary_extensions(schema: &Schema, root: &RawSchema) -> Schema {
 
 /// `field` (exported as `node`) and the fields below it, as in [`with_dictionary_extensions`].
 fn field_with_dictionary_extensions(field: &Field, node: &RawSchema) -> Field {
+    // The first value node of the dictionary chain that carries an extension: starfix-python
+    // unwraps dictionaries down to the first type that is not one, which may be an extension
+    // whose storage is a dictionary again (its keys then sit on an intermediate node).
     let mut logical = node;
+    let mut extension_pairs = None;
     while !logical.dictionary.is_null() {
         // SAFETY: a non-null `dictionary` is the valid value-type schema (C Data Interface).
         logical = unsafe { &*logical.dictionary };
+        if extension_pairs.is_none() {
+            let pairs = metadata_pairs(logical);
+            if has_key(&pairs, EXTENSION_NAME) {
+                extension_pairs = Some(pairs);
+            }
+        }
     }
     let data_type = type_with_dictionary_extensions(field.data_type(), logical);
     let mut metadata = field.metadata().clone();
-    let pairs = metadata_pairs(logical);
-    if !ptr::eq(logical, node) && has_key(&pairs, EXTENSION_NAME) {
+    if let Some(pairs) = extension_pairs {
         for key in [EXTENSION_NAME, EXTENSION_METADATA] {
             let value = String::from_utf8_lossy(value_of(&pairs, key)).into_owned();
             metadata

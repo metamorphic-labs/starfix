@@ -90,7 +90,22 @@ class NulNamedPoint(pa.ExtensionType):
         return cls()
 
 
-for _extension_type in (Point(), BinaryPoint(), NulNamedPoint()):
+class DictionaryPoint(pa.ExtensionType):
+    """An extension type whose storage is a dictionary: in a dictionary, its keys are exported on
+    an intermediate dictionary node."""
+
+    def __init__(self):
+        super().__init__(pa.dictionary(pa.int8(), pa.string()), "starfix.test.dictionary-point")
+
+    def __arrow_ext_serialize__(self):
+        return b"d1"
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls()
+
+
+for _extension_type in (Point(), BinaryPoint(), NulNamedPoint(), DictionaryPoint()):
     try:
         pa.register_extension_type(_extension_type)
     except pa.ArrowKeyError:
@@ -285,6 +300,12 @@ def differential_cases() -> dict[str, tuple[pa.Schema, list[pa.RecordBatch]]]:
             )
         ],
     )
+    # Schemas only: pyarrow builds no arrays of a dictionary of dictionaries.
+    for case_id, t in [
+        ("dictionary-storage", DictionaryPoint()),
+        ("in-dictionary-with-dictionary-storage", pa.dictionary(pa.int16(), DictionaryPoint())),
+    ]:
+        cases[f"extension-{case_id}"] = (pa.schema([pa.field("d", t)]), [])
     for case_id, batch in dictionary_of_point_batches().items():
         cases[f"extension-in-dictionary:{case_id}"] = (batch.schema, [batch])
     for case_id, batch in binary_metadata_cases().items():
