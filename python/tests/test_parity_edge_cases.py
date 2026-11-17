@@ -171,6 +171,29 @@ def test_a_conflicting_batch_is_refused_by_a_digester_of_the_plain_schema():
         prepared.hash_record_batch(point_batch(schema))
 
 
+def test_a_conflicting_batch_is_refused_by_a_prepared_schema_of_its_exported_twin():
+    # pyarrow exports the conflicting field as its storage type with the explicit metadata: the
+    # export of a valid schema, so a same-schema check on exports would accept the conflicting
+    # batch (a finding on starfix-python PR 13; 0.5.0's one-shot calls refuse the batch).
+    _, schema, _, key, explicit, _ = CONFLICTS[0]
+    metadata = {key: explicit, "ARROW:extension:metadata": POINT_SERIALIZED}
+    twin = pa.schema([pa.field("p", Point().storage_type, metadata=metadata)])
+    assert pa.Schema._import_from_c_capsule(schema.__arrow_c_schema__()).equals(twin, check_metadata=True)
+    prepared = ArrowDigester.prepare(twin, include_metadata=True)
+    batch = point_batch(schema)
+    for call in (
+        lambda: prepared.hash_record_batch(batch),
+        lambda: prepared.hash_table(pa.Table.from_batches([batch])),
+        lambda: prepared.digester().update(batch),
+    ):
+        with pytest.raises(ValueError, match="conflicting with its extension type"):
+            call()
+    # The twin itself is valid: its batches hash, through the prepared path as one-shot.
+    good = pa.RecordBatch.from_arrays([batch.column(0).storage], schema=twin)
+    assert prepared.hash_record_batch(good) == ArrowDigester.hash_record_batch(good, include_metadata=True)
+    assert prepared.hash_table(pa.Table.from_batches([good])) == prepared.hash_record_batch(good)
+
+
 def test_extension_metadata_equal_to_the_types_own_is_accepted():
     own = {
         "ARROW:extension:name": POINT_NAME,
