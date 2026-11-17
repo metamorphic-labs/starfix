@@ -5,14 +5,19 @@
 | Registry | Package | Built from | Workflow | GitHub environment |
 |---|---|---|---|---|
 | crates.io | `starfix` (crate) | this repository | `release.yml` | `crates` |
-| TestPyPI | `starfix` (wheels + sdist) | this repository (`python/starfix`, PyO3) | `maturin-release.yml` | `testpypi` |
-| PyPI | `starfix` (wheels + sdist) | this repository (`python/starfix`, PyO3) | `maturin-release.yml` | `pypi` |
+| TestPyPI | `starfix` (wheels + sdist) | this repository (`python/starfix`, PyO3) | `maturin-release.yml` (pending) | `testpypi` |
+| PyPI | `starfix` (wheels + sdist) | this repository (`python/starfix`, PyO3) | `maturin-release.yml` (pending) | `pypi` |
 
 From 0.6.0 the PyPI package `starfix` is built from this repository. `metamorphic-labs/starfix-python`
 (the pure-Python implementation, which published `starfix` up to 0.5.x) is frozen at 0.5.x and
-publishes nothing new under that name. Every hash of 0.6.0 must be byte-identical to 0.5.0 for the
-same input and options; the differential test in `python/tests` checks this against the published
-0.5.0.
+publishes nothing new under that name. starfix-python 0.5.0 and this crate both produce hash
+format 2 (`00 00 02`) and share the golden vectors in `tests/golden`. Every hash of 0.6.0 must be
+byte-identical to starfix 0.5.0's for the same input and options. Do not release the Python
+package until a test proves this against the published 0.5.0.
+
+**Pending:** `maturin-release.yml` does not publish yet. On `main` it is commented out; the PyO3
+package and its wheel builds are in review, and the TestPyPI and PyPI publish jobs are a follow-up.
+Until both have landed, a release publishes the crate only.
 
 ## Who releases
 
@@ -33,9 +38,10 @@ the table above. Only the job that publishes declares that environment and gets
    The job runs in the environment `crates`. cargo-release bumps `Cargo.toml`, commits
    `chore: release v<version>`, pushes the commit and the tag `v<version>`, and publishes the
    crate to crates.io.
-3. The pushed tag `v<version>` triggers `ci.yml` (it checks that the tag matches `Cargo.toml`) and
-   `maturin-release.yml`. That workflow builds and tests the wheels and the sdist, publishes them to
-   TestPyPI (environment `testpypi`), and then to PyPI (environment `pypi`).
+3. The pushed tag `v<version>` triggers `ci.yml`, which checks that the tag matches `Cargo.toml`.
+4. Once the publish jobs exist (see **Pending**): the same tag triggers `maturin-release.yml`. It
+   builds and tests the wheels and the sdist, publishes them to TestPyPI (environment `testpypi`),
+   and then to PyPI (environment `pypi`).
 
 ## Repository setup the maintainer does (not done by any workflow or pull request)
 
