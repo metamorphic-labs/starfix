@@ -19,6 +19,7 @@ from _parity_cases import (
     POINT_NAME,
     POINT_SERIALIZED,
     BinaryPoint,
+    DictionaryPoint,
     Point,
     bufferless_empty,
     bufferless_nested,
@@ -404,3 +405,29 @@ def test_a_serialization_that_is_not_utf8_is_refused_with_include_metadata():
         ):
             with pytest.raises(UnicodeDecodeError):
                 call()
+
+
+def test_an_extension_with_dictionary_storage_in_a_dictionary_keeps_its_metadata():
+    # Its keys are exported on an intermediate dictionary node, which the import skipped: the
+    # field hashed as the storage type with include_metadata (CodeRabbit on b3bdb9a).
+    for t in (DictionaryPoint(), pa.dictionary(pa.int16(), DictionaryPoint())):
+        schema = pa.schema([pa.field("d", t)])
+        storage_type = (
+            t.storage_type
+            if isinstance(t, pa.BaseExtensionType)
+            else pa.dictionary(pa.int16(), DictionaryPoint().storage_type)
+        )
+        storage = pa.schema([pa.field("d", storage_type)])
+        assert ArrowDigester.hash_schema(schema) == ArrowDigester.hash_schema(storage)
+        assert ArrowDigester.hash_schema(schema, include_metadata=True) != ArrowDigester.hash_schema(
+            storage, include_metadata=True
+        )
+        assert ArrowDigester.prepare(schema, include_metadata=True).schema_digest == ArrowDigester.hash_schema(
+            schema, include_metadata=True
+        )
+    # The same extension at the top level and in a dictionary: the same field metadata.
+    assert ArrowDigester.hash_schema(
+        pa.schema([pa.field("d", DictionaryPoint())]), include_metadata=True
+    ) == ArrowDigester.hash_schema(
+        pa.schema([pa.field("d", pa.dictionary(pa.int16(), DictionaryPoint()))]), include_metadata=True
+    )
