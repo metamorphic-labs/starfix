@@ -22,6 +22,7 @@ from _parity_cases import (
     bufferless_empty,
     bufferless_nested,
     binary_metadata_cases,
+    dictionary_of_point_batches,
     extension_conflicts,
     nested_dictionary_schema,
     nul_name_batch,
@@ -232,6 +233,9 @@ def test_repeated_keys_below_nested_dictionaries_are_refused(depth):
 NUL_NAMES = nul_name_cases()
 # List item and map key/value names do not enter the hash (in starfix-python 0.5.0 either).
 NAMES_NOT_HASHED = {"list-item", "map-key-and-value"}
+# Data of a map is not hashed (byte-layout spec Section 8); cut, these names repeat.
+DATA_NOT_HASHED = {"map-key-and-value"}
+CUT_NAMES_REPEAT = {"top-beside-its-prefix", "struct"}
 
 
 def _hashes(schema: pa.Schema, batch: pa.RecordBatch, options: dict) -> dict[str, object]:
@@ -274,6 +278,15 @@ def test_names_containing_nul_are_hashed_in_full(case, options):
     schema, cut, rows = NUL_NAMES[case]
     batch = nul_name_batch(schema, rows)
     hashes = _hashes(schema, batch, options)
+    # Every call hashes, except the data of a map, which no implementation hashes.
+    data_calls = [k for k in hashes if k not in ("hash_schema", "prepared.schema_digest", "hash_array")]
+    assert isinstance(hashes["hash_schema"], bytes) and isinstance(hashes["prepared.schema_digest"], bytes)
+    if case in DATA_NOT_HASHED:
+        assert all(hashes[k] is ValueError for k in data_calls), hashes
+        assert all(h is ValueError for h in hashes["hash_array"]), hashes
+    else:
+        assert all(isinstance(hashes[k], bytes) for k in data_calls), hashes
+        assert all(isinstance(h, bytes) for h in hashes["hash_array"]), hashes
     # One-shot, streaming and prepared agree (the prepared and streaming paths decide the names
     # once per schema, the one-shot calls on every call).
     for one_shot, others in [
@@ -282,12 +295,13 @@ def test_names_containing_nul_are_hashed_in_full(case, options):
         ("hash_table", ["prepared.hash_table", "stream", "prepared.digester"]),
     ]:
         assert all(hashes[other] == hashes[one_shot] for other in others), (case, one_shot, hashes)
-    # The names are not cut at the NUL: where names are hashed, the schema with cut names hashes
-    # differently or (with a name repeated once cut) is refused.
-    try:
-        cut_digest = ArrowDigester.hash_schema(cut, **options)
-    except ValueError:
-        cut_digest = None
+    # The names are not cut at the NUL. Where the cut names repeat, the cut schema is refused;
+    # elsewhere it hashes, the same as the full names only where names are not hashed.
+    if case in CUT_NAMES_REPEAT:
+        with pytest.raises(ValueError, match="Ambiguous"):
+            ArrowDigester.hash_schema(cut, **options)
+        return
+    cut_digest = ArrowDigester.hash_schema(cut, **options)
     if case in NAMES_NOT_HASHED:
         assert hashes["hash_schema"] == cut_digest
     else:
@@ -332,3 +346,41 @@ def test_metadata_that_is_not_utf8_is_ignored_unless_hashed(case):
     ):
         with pytest.raises(UnicodeDecodeError):
             call()
+
+
+# --- a dictionary of an extension type ----------------------------------------------------
+
+DICTIONARY_OF_POINT = dictionary_of_point_batches()
+
+
+@pytest.mark.parametrize("case", sorted(DICTIONARY_OF_POINT))
+def test_a_dictionary_of_an_extension_type_hashes_its_extension_metadata(case):
+    # The extension's keys are exported on the dictionary's value type, and were lost on import:
+    # with include_metadata the field hashed as a dictionary of the storage type.
+    batch = DICTIONARY_OF_POINT[case]
+    storage = pa.schema([_dictionary_of_storage(field) for field in batch.schema])
+    storage_batch = pa.RecordBatch.from_arrays(
+        [column.cast(field.type) for column, field in zip(batch.columns, storage)], schema=storage
+    )
+    with_metadata = {"include_metadata": True}
+    assert ArrowDigester.hash_schema(batch.schema) == ArrowDigester.hash_schema(storage)
+    assert ArrowDigester.hash_schema(batch.schema, **with_metadata) != ArrowDigester.hash_schema(
+        storage, **with_metadata
+    )
+    digest = ArrowDigester.hash_record_batch(batch, **with_metadata)
+    assert digest != ArrowDigester.hash_record_batch(storage_batch, **with_metadata)
+    prepared = ArrowDigester.prepare(batch.schema, **with_metadata)
+    assert prepared.hash_record_batch(batch) == digest
+    assert prepared.hash_table(pa.Table.from_batches([batch])) == digest
+    with pytest.raises(ValueError, match="does not match"):
+        ArrowDigester.prepare(storage, **with_metadata).hash_record_batch(batch)
+
+
+def _dictionary_of_storage(field: pa.Field) -> pa.Field:
+    """The field with each dictionary of an extension type made a dictionary of its storage."""
+    t = field.type
+    if pa.types.is_dictionary(t) and isinstance(t.value_type, pa.BaseExtensionType):
+        t = pa.dictionary(t.index_type, t.value_type.storage_type)
+    elif pa.types.is_struct(t):
+        t = pa.struct([_dictionary_of_storage(child) for child in t])
+    return field.with_type(t)

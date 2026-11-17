@@ -79,6 +79,23 @@ def point_batch(schema: pa.Schema) -> pa.RecordBatch:
     return pa.RecordBatch.from_arrays([column], schema=schema)
 
 
+def dictionary_of_point_batches() -> dict[str, pa.RecordBatch]:
+    """{case: a batch with a dictionary of Points}: the extension's keys are on the
+    dictionary's value type, which starfix-python hashes as the field's metadata."""
+    storage = pa.array([{"x": 1}, {"x": 2}], Point().storage_type)
+    values = pa.ExtensionArray.from_storage(Point(), storage)
+    column = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0], pa.int8()), values)
+    field = pa.field("d", column.type)
+    nested = pa.StructArray.from_arrays([column], fields=[field])
+    return {
+        "top": pa.RecordBatch.from_arrays([column], schema=pa.schema([field])),
+        "with-field-metadata": pa.RecordBatch.from_arrays(
+            [column], schema=pa.schema([field.with_metadata({"k": "v"})])
+        ),
+        "in-struct": pa.RecordBatch.from_arrays([nested], names=["s"]),
+    }
+
+
 def extension_conflicts():
     """(id, schema, node path, key, explicit value, the type's own value): a Point field whose
     explicit ARROW:extension:* metadata differs from what the type itself exports."""
@@ -214,6 +231,8 @@ def differential_cases() -> dict[str, tuple[pa.Schema, list[pa.RecordBatch]]]:
             nested_dictionary_schema(depth),
             [],
         )
+    for case_id, batch in dictionary_of_point_batches().items():
+        cases[f"extension-in-dictionary:{case_id}"] = (batch.schema, [batch])
     for case_id, batch in binary_metadata_cases().items():
         cases[f"binary-metadata:{case_id}"] = (batch.schema, [batch])
     for case_id, (schema, _, rows) in nul_name_cases().items():

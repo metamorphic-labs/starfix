@@ -218,9 +218,14 @@ fn import_record_batch(
     }
     let exported =
         Schema::try_from(ffi_schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let with_extensions = if include_metadata {
+        with_dictionary_extensions(&exported, raw_schema(ffi_schema))
+    } else {
+        exported.clone()
+    };
     let schema = match full_names {
-        Some(py_schema) => with_full_names(&exported, py_schema)?,
-        None => exported.clone(),
+        Some(py_schema) => with_full_names(&with_extensions, py_schema)?,
+        None => with_extensions,
     };
     importing(|| {
         let struct_type = DataType::Struct(exported.fields().clone());
@@ -231,12 +236,14 @@ fn import_record_batch(
                 "expected a record batch (a struct array from __arrow_c_array__)",
             ));
         }
-        let array_data = match full_names {
-            Some(_) => retyped(
+        // The columns' types carry the names and nested metadata of the schema's.
+        let array_data = if schema.fields() == exported.fields() {
+            imported(raw_data)
+        } else {
+            retyped(
                 imported(raw_data),
                 &DataType::Struct(schema.fields().clone()),
-            ),
-            None => imported(raw_data),
+            )
         };
         let num_rows = array_data.len();
         let (_, columns, _) = StructArray::from(array_data).into_parts();
@@ -339,9 +346,86 @@ fn import_schema(
     }
     let exported = Schema::try_from(ffi_schema)
         .map_err(|error| PyArrowException::new_err(error.to_string()))?;
+    let with_extensions = if include_metadata {
+        with_dictionary_extensions(&exported, raw_schema(ffi_schema))
+    } else {
+        exported
+    };
     match full_names {
-        Some(py_schema) => with_full_names(&exported, py_schema),
-        None => Ok(exported),
+        Some(py_schema) => with_full_names(&with_extensions, py_schema),
+        None => Ok(with_extensions),
+    }
+}
+
+/// `schema` with the `ARROW:extension:*` keys of a dictionary's extension value type on the
+/// dictionary's field, at every depth. The export puts them on the dictionary's value node,
+/// which arrow-rs's import drops; starfix-python hashes them as the field's metadata, explicit
+/// keys of the field first (byte-layout spec Section 2.3). `root` is the schema's export.
+fn with_dictionary_extensions(schema: &Schema, root: &RawSchema) -> Schema {
+    let nodes: Vec<&RawSchema> = children(root).collect();
+    if nodes.len() != schema.fields().len() {
+        return schema.clone();
+    }
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(nodes)
+        .map(|(field, node)| field_with_dictionary_extensions(field, node))
+        .collect::<Vec<_>>();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// `field` (exported as `node`) and the fields below it, as in [`with_dictionary_extensions`].
+fn field_with_dictionary_extensions(field: &Field, node: &RawSchema) -> Field {
+    let mut logical = node;
+    while !logical.dictionary.is_null() {
+        // SAFETY: a non-null `dictionary` is the valid value-type schema (C Data Interface).
+        logical = unsafe { &*logical.dictionary };
+    }
+    let data_type = type_with_dictionary_extensions(field.data_type(), logical);
+    let mut metadata = field.metadata().clone();
+    let pairs = metadata_pairs(logical);
+    if !ptr::eq(logical, node) && has_key(&pairs, EXTENSION_NAME) {
+        for key in [EXTENSION_NAME, EXTENSION_METADATA] {
+            let value = String::from_utf8_lossy(value_of(&pairs, key)).into_owned();
+            metadata
+                .entry(String::from_utf8_lossy(key).into_owned())
+                .or_insert(value);
+        }
+    }
+    field
+        .clone()
+        .with_data_type(data_type)
+        .with_metadata(metadata)
+}
+
+/// `data_type`, whose logical (non-dictionary) node is exported as `logical`, with the fields
+/// below it as in [`with_dictionary_extensions`].
+fn type_with_dictionary_extensions(data_type: &DataType, logical: &RawSchema) -> DataType {
+    let nodes: Vec<&RawSchema> = children(logical).collect();
+    let child = |field: &FieldRef| -> FieldRef {
+        nodes.first().map_or_else(
+            || Arc::clone(field),
+            |node| Arc::new(field_with_dictionary_extensions(field, node)),
+        )
+    };
+    match data_type {
+        DataType::Dictionary(key, value) => DataType::Dictionary(
+            key.clone(),
+            Box::new(type_with_dictionary_extensions(value, logical)),
+        ),
+        DataType::Struct(fields) if fields.len() == nodes.len() => DataType::Struct(
+            fields
+                .iter()
+                .zip(&nodes)
+                .map(|(field, node)| field_with_dictionary_extensions(field, node))
+                .collect(),
+        ),
+        DataType::List(field) => DataType::List(child(field)),
+        DataType::LargeList(field) => DataType::LargeList(child(field)),
+        DataType::FixedSizeList(field, size) => DataType::FixedSizeList(child(field), *size),
+        DataType::Map(entries, sorted) => DataType::Map(child(entries), *sorted),
+        _ => data_type.clone(),
     }
 }
 
@@ -1029,9 +1113,11 @@ impl Digester {
         hashing(py, || digester.try_update(&batch))
     }
 
-    /// The hash of everything added so far (the digester stays usable).
+    /// The hash of everything added so far (the digester stays usable), without the GIL.
     fn finalize<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        bytes(py, &self.digester.clone().finalize())
+        let digester = &self.digester;
+        let digest = py.detach(|| digester.clone().finalize());
+        bytes(py, &digest)
     }
 }
 
