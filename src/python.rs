@@ -87,7 +87,7 @@ fn pyarrow_name(py: Python<'_>, data_type: &DataType) -> String {
         .unwrap_or_else(|_| data_type.to_string())
 }
 
-/// Whether a field name in `data_type`, at any depth, contains NUL.
+/// Whether a field name or a time zone in `data_type`, at any depth, contains NUL.
 fn has_nul_name(data_type: &DataType) -> bool {
     let nul_in = |field: &Field| field.name().contains('\0') || has_nul_name(field.data_type());
     match data_type {
@@ -101,6 +101,7 @@ fn has_nul_name(data_type: &DataType) -> bool {
         | DataType::Map(field, _) => nul_in(field),
         DataType::RunEndEncoded(run_ends, values) => nul_in(run_ends) || nul_in(values),
         DataType::Dictionary(_, value) => has_nul_name(value),
+        DataType::Timestamp(_, Some(time_zone)) => time_zone.contains('\0'),
         _ => false,
     }
 }
@@ -450,8 +451,8 @@ fn with_full_field_names(field: &Field, py_field: &Bound<'_, PyAny>) -> PyResult
     Ok(field.clone().with_name(name).with_data_type(data_type))
 }
 
-/// `data_type` with the field names of `py_type` (its `pyarrow.DataType`) at every depth. An
-/// extension type is its storage type here, as in arrow-rs.
+/// `data_type` with the field names and time zones of `py_type` (its `pyarrow.DataType`) at
+/// every depth. An extension type is its storage type here, as in arrow-rs.
 fn with_full_type_names(data_type: &DataType, py_type: &Bound<'_, PyAny>) -> PyResult<DataType> {
     let mut storage = py_type.clone();
     while storage.hasattr("storage_type")? {
@@ -500,6 +501,11 @@ fn with_full_type_names(data_type: &DataType, py_type: &Bound<'_, PyAny>) -> PyR
                 &storage.getattr("value_type")?,
             )?),
         ),
+        // The time zone is a C string in the type's format too.
+        DataType::Timestamp(unit, _) => {
+            let time_zone: Option<String> = storage.getattr("tz")?.extract()?;
+            DataType::Timestamp(*unit, time_zone.map(Into::into))
+        }
         _ => data_type.clone(),
     })
 }

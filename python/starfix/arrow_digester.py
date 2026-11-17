@@ -96,12 +96,15 @@ def _child_nodes(t: pa.DataType, path: str) -> list[tuple[str, pa.Field]]:
     return []
 
 
-_WRAPPERS = (pa.DictionaryType, pa.BaseExtensionType)
+# Types whose own strings or children may hold a NUL: wrappers, and timestamps (time zone).
+_WRAPPERS = (pa.DictionaryType, pa.BaseExtensionType, pa.TimestampType)
 
 
 def _type_has_nul_name(t: pa.DataType) -> bool:
-    """Whether a field name below type `t`, at any depth, contains NUL."""
+    """Whether a field name below type `t`, or a time zone at or below it, contains NUL."""
     t = _logical(t)
+    if pa.types.is_timestamp(t):
+        return t.tz is not None and "\x00" in t.tz
     if pa.types.is_struct(t):
         fields = [t.field(i) for i in range(t.num_fields)]
     elif pa.types.is_map(t):
@@ -118,10 +121,11 @@ def _type_has_nul_name(t: pa.DataType) -> bool:
 
 
 def _has_nul_name(schema: pa.Schema) -> bool:
-    """Whether a field name of `schema`, at any depth, contains NUL.
+    """Whether a field name of `schema` or a time zone, at any depth, contains NUL.
 
-    The Arrow C Data Interface carries names as C strings, which end at the first NUL; for such
-    a schema the native module takes the names from pyarrow (they are hashed in full).
+    The Arrow C Data Interface carries names and type formats (a timestamp's time zone) as C
+    strings, which end at the first NUL; for such a schema the native module takes the names and
+    time zones from pyarrow (they are hashed in full).
     """
     if any("\x00" in name for name in schema.names):
         return True
