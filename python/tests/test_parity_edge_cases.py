@@ -23,6 +23,8 @@ from _parity_cases import (
     bufferless_nested,
     extension_conflicts,
     nested_dictionary_schema,
+    nul_name_batch,
+    nul_name_cases,
     point_batch,
     without_metadata,
 )
@@ -222,3 +224,78 @@ def test_repeated_keys_below_nested_dictionaries_are_refused(depth):
             "Field 'd/x': Duplicate metadata key 'k' on the field: ambiguous, rejected with include_metadata"
         )
     ArrowDigester.hash_schema(schema)  # without the option, metadata is not read
+
+
+# --- field names containing NUL -----------------------------------------------------------
+
+NUL_NAMES = nul_name_cases()
+# List item and map key/value names do not enter the hash (in starfix-python 0.5.0 either).
+NAMES_NOT_HASHED = {"list-item", "map-key-and-value"}
+
+
+def _hashes(schema: pa.Schema, batch: pa.RecordBatch, options: dict) -> dict[str, object]:
+    """Every hash of the batch, or the exception type of the call."""
+
+    def outcome(call):
+        try:
+            return call()
+        except ValueError as error:
+            return type(error)
+
+    prepared = ArrowDigester.prepare(schema, **options)
+
+    def streamed(digester):
+        digester.update(batch)
+        return digester.finalize()
+
+    table = pa.Table.from_batches([batch, batch])
+    array_options = {k: v for k, v in options.items() if k != "include_metadata"}
+    return {
+        "hash_schema": outcome(lambda: ArrowDigester.hash_schema(schema, **options)),
+        "prepared.schema_digest": prepared.schema_digest,
+        "hash_record_batch": outcome(lambda: ArrowDigester.hash_record_batch(batch, **options)),
+        "prepared.hash_record_batch": outcome(lambda: prepared.hash_record_batch(batch)),
+        "hash_table": outcome(lambda: ArrowDigester.hash_table(table, **options)),
+        "prepared.hash_table": outcome(lambda: prepared.hash_table(table)),
+        "stream": outcome(lambda: streamed(ArrowDigester(schema, **options))),
+        "prepared.digester": outcome(lambda: streamed(prepared.digester())),
+        "hash_array": [ArrowDigester.hash_array(column, **array_options) for column in batch.columns],
+    }
+
+
+@pytest.mark.parametrize("case", sorted(NUL_NAMES))
+@pytest.mark.parametrize(
+    "options", [{}, {"include_metadata": True, "ordered_struct_fields": True}], ids=["default", "options"]
+)
+def test_names_containing_nul_are_hashed_in_full(case, options):
+    schema, cut, rows = NUL_NAMES[case]
+    batch = nul_name_batch(schema, rows)
+    hashes = _hashes(schema, batch, options)
+    # One-shot, streaming and prepared agree (the prepared and streaming paths decide the names
+    # once per schema, the one-shot calls on every call).
+    for one_shot, others in [
+        ("hash_schema", ["prepared.schema_digest"]),
+        ("hash_record_batch", ["prepared.hash_record_batch"]),
+        ("hash_table", ["prepared.hash_table", "stream", "prepared.digester"]),
+    ]:
+        assert all(hashes[other] == hashes[one_shot] for other in others), (case, one_shot, hashes)
+    # The names are not cut at the NUL: where names are hashed, the schema with cut names hashes
+    # differently or (with a name repeated once cut) is refused.
+    try:
+        cut_digest = ArrowDigester.hash_schema(cut, **options)
+    except ValueError:
+        cut_digest = None
+    if case in NAMES_NOT_HASHED:
+        assert hashes["hash_schema"] == cut_digest
+    else:
+        assert hashes["hash_schema"] != cut_digest
+
+
+def test_a_prepared_schema_tells_names_cut_at_nul_apart():
+    # Only "top" has data and cut names that do not repeat (the others are refused or not hashed).
+    schema, cut, rows = NUL_NAMES["top"]
+    cut_prepared = ArrowDigester.prepare(cut)
+    with pytest.raises(ValueError, match="does not match"):
+        cut_prepared.hash_record_batch(nul_name_batch(schema, rows))
+    with pytest.raises(ValueError, match="does not match"):
+        ArrowDigester.prepare(schema).hash_record_batch(nul_name_batch(cut, rows))

@@ -27,7 +27,7 @@ use arrow::array::{
 };
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::pyarrow::{FromPyArrow as _, PyArrowException, ToPyArrow as _};
-use arrow_schema::{ArrowError, DataType, Schema};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule, PyTuple};
@@ -169,8 +169,14 @@ fn take_array(
 ///
 /// With `include_metadata`, metadata that starfix-python refuses is refused first: a repeated
 /// key (arrow-rs keeps one value of a repeated key on import) and explicit extension metadata
-/// that conflicts with a registered extension type ([`check_extension_metadata`]).
-fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyResult<RecordBatch> {
+/// that conflicts with a registered extension type ([`check_extension_metadata`]). With
+/// `full_names` (the batch's `pyarrow.Schema`, when a name contains NUL), the field names are
+/// taken from it ([`with_full_names`]).
+fn import_record_batch(
+    batch: &Bound<'_, PyAny>,
+    include_metadata: bool,
+    full_names: Option<&Bound<'_, PyAny>>,
+) -> PyResult<RecordBatch> {
     let (schema_capsule, array_capsule) = array_capsules(batch)?;
     // SAFETY:
     // The capsule holds a valid `ArrowSchema` exported by its producer and stays alive (and
@@ -179,8 +185,9 @@ fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyRe
     if include_metadata && check_metadata(ffi_schema)? {
         check_extension_metadata(&batch.getattr("schema")?)?;
     }
-    let schema = Schema::try_from(ffi_schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let struct_type = DataType::Struct(schema.fields().clone());
+    let exported =
+        Schema::try_from(ffi_schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let struct_type = DataType::Struct(exported.fields().clone());
     let raw_data = take_array(&array_capsule, ffi_schema, &struct_type)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     if !matches!(raw_data.data_type(), DataType::Struct(_)) {
@@ -188,7 +195,14 @@ fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyRe
             "expected a record batch (a struct array from __arrow_c_array__)",
         ));
     }
-    let array_data = imported(raw_data);
+    let (schema, array_data) = match full_names {
+        Some(py_schema) => {
+            let schema = with_full_names(&exported, py_schema)?;
+            let named = DataType::Struct(schema.fields().clone());
+            (schema, retyped(imported(raw_data), &named))
+        }
+        None => (exported, imported(raw_data)),
+    };
     let num_rows = array_data.len();
     let (_, columns, _) = StructArray::from(array_data).into_parts();
     RecordBatch::try_new_with_options(
@@ -201,20 +215,32 @@ fn import_record_batch(batch: &Bound<'_, PyAny>, include_metadata: bool) -> PyRe
 
 /// An array (`pa.Array`) from its `__arrow_c_array__` capsules, as arrow-rs's `pyarrow` feature
 /// imports it (an import error raises `pyarrow.ArrowException`), its empty nodes given offsets.
-fn import_array(array: &Bound<'_, PyAny>) -> PyResult<ArrayData> {
+/// With `full_type` (its `pyarrow.DataType`, when a name contains NUL), the field names are
+/// taken from it.
+fn import_array(
+    array: &Bound<'_, PyAny>,
+    full_type: Option<&Bound<'_, PyAny>>,
+) -> PyResult<ArrayData> {
     let (schema_capsule, array_capsule) = array_capsules(array)?;
     // SAFETY: as in `import_record_batch`.
     let ffi_schema = unsafe { schema_capsule.reference::<FFI_ArrowSchema>() };
     let arrow_error = |error: ArrowError| PyArrowException::new_err(error.to_string());
     let data_type = DataType::try_from(ffi_schema).map_err(arrow_error)?;
-    Ok(imported(
-        take_array(&array_capsule, ffi_schema, &data_type).map_err(arrow_error)?,
-    ))
+    let data = imported(take_array(&array_capsule, ffi_schema, &data_type).map_err(arrow_error)?);
+    match full_type {
+        Some(py_type) => Ok(retyped(data, &with_full_type_names(&data_type, py_type)?)),
+        None => Ok(data),
+    }
 }
 
 /// A schema through arrow-rs's `pyarrow` feature, metadata included. With `include_metadata`,
-/// metadata that starfix-python refuses is refused first, as in [`import_record_batch`].
-fn import_schema(schema: &Bound<'_, PyAny>, include_metadata: bool) -> PyResult<Schema> {
+/// metadata that starfix-python refuses is refused first, as in [`import_record_batch`]. With
+/// `full_names` (the same schema, when a name contains NUL), the names are taken from pyarrow.
+fn import_schema(
+    schema: &Bound<'_, PyAny>,
+    include_metadata: bool,
+    full_names: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Schema> {
     if include_metadata {
         let (capsule, _) = capsules(schema, "__arrow_c_schema__")?;
         check_capsule_name(&capsule, c"arrow_schema")?;
@@ -223,7 +249,117 @@ fn import_schema(schema: &Bound<'_, PyAny>, include_metadata: bool) -> PyResult<
             check_extension_metadata(schema)?;
         }
     }
-    Schema::from_pyarrow_bound(schema)
+    let exported = Schema::from_pyarrow_bound(schema)?;
+    match full_names {
+        Some(py_schema) => with_full_names(&exported, py_schema),
+        None => Ok(exported),
+    }
+}
+
+/// `schema` with the field names, at every depth, of `py_schema`: the `pyarrow.Schema` it was
+/// exported from. The Arrow C Data Interface carries a name as a C string, which ends at the
+/// first NUL; starfix-python hashes the whole name (the Python layer passes `py_schema` only
+/// when a name contains NUL).
+fn with_full_names(schema: &Schema, py_schema: &Bound<'_, PyAny>) -> PyResult<Schema> {
+    let fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| with_full_field_names(field, &py_schema.call_method1("field", (i,))?))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// `field` with the name of `py_field` (its `pyarrow.Field`) and the names below it.
+fn with_full_field_names(field: &Field, py_field: &Bound<'_, PyAny>) -> PyResult<Field> {
+    let name: String = py_field.getattr("name")?.extract()?;
+    let data_type = with_full_type_names(field.data_type(), &py_field.getattr("type")?)?;
+    Ok(field.clone().with_name(name).with_data_type(data_type))
+}
+
+/// `data_type` with the field names of `py_type` (its `pyarrow.DataType`) at every depth. An
+/// extension type is its storage type here, as in arrow-rs.
+fn with_full_type_names(data_type: &DataType, py_type: &Bound<'_, PyAny>) -> PyResult<DataType> {
+    let mut storage = py_type.clone();
+    while storage.hasattr("storage_type")? {
+        storage = storage.getattr("storage_type")?;
+    }
+    let child = |field: &FieldRef, attribute: &str| -> PyResult<FieldRef> {
+        Ok(Arc::new(with_full_field_names(
+            field,
+            &storage.getattr(attribute)?,
+        )?))
+    };
+    Ok(match data_type {
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    with_full_field_names(field, &storage.call_method1("field", (i,))?)
+                })
+                .collect::<PyResult<Fields>>()?,
+        ),
+        DataType::List(field) => DataType::List(child(field, "value_field")?),
+        DataType::LargeList(field) => DataType::LargeList(child(field, "value_field")?),
+        DataType::FixedSizeList(field, size) => {
+            DataType::FixedSizeList(child(field, "value_field")?, *size)
+        }
+        DataType::Map(entries, sorted) => {
+            let DataType::Struct(key_value) = entries.data_type() else {
+                return Ok(data_type.clone());
+            };
+            let names = key_value
+                .iter()
+                .zip(["key_field", "item_field"])
+                .map(|(field, attribute)| child(field, attribute))
+                .collect::<PyResult<Fields>>()?;
+            let named_entries = entries
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Struct(names));
+            DataType::Map(Arc::new(named_entries), *sorted)
+        }
+        DataType::Dictionary(key, value) => DataType::Dictionary(
+            key.clone(),
+            Box::new(with_full_type_names(
+                value,
+                &storage.getattr("value_type")?,
+            )?),
+        ),
+        _ => data_type.clone(),
+    })
+}
+
+/// `data` as an array of `data_type`, which differs from its type in field names only.
+fn retyped(data: ArrayData, data_type: &DataType) -> ArrayData {
+    let children: Vec<ArrayData> = match data_type {
+        DataType::Struct(fields) => data
+            .child_data()
+            .iter()
+            .zip(fields.iter())
+            .map(|(child, field)| retyped(child.clone(), field.data_type()))
+            .collect(),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => data
+            .child_data()
+            .iter()
+            .map(|child| retyped(child.clone(), field.data_type()))
+            .collect(),
+        DataType::Dictionary(_, value) => data
+            .child_data()
+            .iter()
+            .map(|child| retyped(child.clone(), value))
+            .collect(),
+        _ => data.child_data().to_vec(),
+    };
+    rebuilt(
+        data.into_builder()
+            .data_type(data_type.clone())
+            .child_data(children),
+    )
 }
 
 /// Refuse explicit `ARROW:extension:*` field metadata that conflicts with the field's
@@ -390,7 +526,8 @@ fn without_struct_offsets(data: ArrayData) -> ArrayData {
     )
 }
 
-/// Build an imported array re-expressed by [`without_struct_offsets`] or [`rows`], unchecked.
+/// Build an imported array re-expressed by [`without_struct_offsets`], [`rows`] or [`retyped`],
+/// unchecked.
 ///
 /// Full validation is not applied, as `from_ffi` does not apply it to the imported array: it
 /// would refuse arrays the format hashes, such as a null in a non-nullable child under a null
@@ -399,7 +536,8 @@ fn rebuilt(builder: ArrayDataBuilder) -> ArrayData {
     // SAFETY:
     // The builder holds the buffers, children and validity of an array imported from the C Data
     // Interface, with the same logical rows: only where a struct's offset is applied changed
-    // (moved from the struct to its children, within their bounds, checked by `rows`).
+    // (moved from the struct to its children, within their bounds, checked by `rows`), or the
+    // field names in its type (`retyped`).
     unsafe { builder.build_unchecked() }
 }
 
@@ -651,16 +789,19 @@ fn extension_metadata<'py>(
     ))
 }
 
-/// `ArrowDigester.hash_schema`.
+/// `ArrowDigester.hash_schema`. Each entry point takes `full_names`: the `pyarrow.Schema` (or
+/// type) to take field names from when one contains NUL, else `None` (see [`with_full_names`]).
 #[pyfunction]
+#[pyo3(signature = (py_schema, include_metadata, ordered_columns, ordered_struct_fields, full_names))]
 fn hash_schema<'py>(
     py: Python<'py>,
     py_schema: &Bound<'py, PyAny>,
     include_metadata: bool,
     ordered_columns: bool,
     ordered_struct_fields: bool,
+    full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let schema = import_schema(py_schema, include_metadata)?;
+    let schema = import_schema(py_schema, include_metadata, full_names)?;
     let config = config(include_metadata, ordered_columns, ordered_struct_fields);
     let digest = hashing(py, || ArrowDigester::try_hash_schema(&schema, config))?;
     Ok(bytes(py, &digest))
@@ -668,14 +809,16 @@ fn hash_schema<'py>(
 
 /// `ArrowDigester.hash_record_batch`.
 #[pyfunction]
+#[pyo3(signature = (py_batch, include_metadata, ordered_columns, ordered_struct_fields, full_names))]
 fn hash_record_batch<'py>(
     py: Python<'py>,
     py_batch: &Bound<'py, PyAny>,
     include_metadata: bool,
     ordered_columns: bool,
     ordered_struct_fields: bool,
+    full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let batch = import_record_batch(py_batch, include_metadata)?;
+    let batch = import_record_batch(py_batch, include_metadata, full_names)?;
     let config = config(include_metadata, ordered_columns, ordered_struct_fields);
     let digest = hashing(py, || ArrowDigester::try_hash_record_batch(&batch, config))?;
     Ok(bytes(py, &digest))
@@ -684,6 +827,9 @@ fn hash_record_batch<'py>(
 /// `ArrowDigester.hash_table`: a digester over `batches`, the table's record batches (a table
 /// without any hashes as a digester without updates, equal to one empty batch).
 #[pyfunction]
+#[pyo3(signature = (
+    py_schema, batches, include_metadata, ordered_columns, ordered_struct_fields, full_names
+))]
 fn hash_table<'py>(
     py: Python<'py>,
     py_schema: &Bound<'py, PyAny>,
@@ -691,6 +837,7 @@ fn hash_table<'py>(
     include_metadata: bool,
     ordered_columns: bool,
     ordered_struct_fields: bool,
+    full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut digester = Digester::new(
         py,
@@ -698,9 +845,10 @@ fn hash_table<'py>(
         include_metadata,
         ordered_columns,
         ordered_struct_fields,
+        full_names,
     )?;
     for py_batch in batches.try_iter()? {
-        digester.update(py, &py_batch?)?;
+        digester.update(py, &py_batch?, full_names)?;
     }
     Ok(digester.finalize(py))
 }
@@ -708,17 +856,23 @@ fn hash_table<'py>(
 /// `ArrowDigester.hash_array`: the chunks of a `ChunkedArray` (or one array), all of type
 /// `py_type`, hashed as their concatenation without concatenating them.
 #[pyfunction]
+#[pyo3(signature = (py_type, py_chunks, ordered_columns, ordered_struct_fields, full_names))]
 fn hash_array<'py>(
     py: Python<'py>,
     py_type: &Bound<'py, PyAny>,
     py_chunks: &Bound<'py, PyAny>,
     ordered_columns: bool,
     ordered_struct_fields: bool,
+    full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let data_type = DataType::from_pyarrow_bound(py_type)?;
+    let exported_type = DataType::from_pyarrow_bound(py_type)?;
+    let data_type = match full_names {
+        Some(full_type) => with_full_type_names(&exported_type, full_type)?,
+        None => exported_type,
+    };
     let chunks = py_chunks
         .try_iter()?
-        .map(|chunk| Ok(make_array(import_array(&chunk?)?)))
+        .map(|chunk| Ok(make_array(import_array(&chunk?, full_names)?)))
         .collect::<PyResult<Vec<_>>>()?;
     let config = config(false, ordered_columns, ordered_struct_fields);
     let digest = hashing(py, || {
@@ -738,14 +892,18 @@ struct Digester {
 #[pymethods]
 impl Digester {
     #[new]
+    #[pyo3(signature = (
+        py_schema, include_metadata, ordered_columns, ordered_struct_fields, full_names
+    ))]
     fn new(
         py: Python<'_>,
         py_schema: &Bound<'_, PyAny>,
         include_metadata: bool,
         ordered_columns: bool,
         ordered_struct_fields: bool,
+        full_names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let schema = import_schema(py_schema, include_metadata)?;
+        let schema = import_schema(py_schema, include_metadata, full_names)?;
         let config = config(include_metadata, ordered_columns, ordered_struct_fields);
         Ok(Self {
             digester: hashing(py, || ArrowDigester::try_new(&schema, config))?,
@@ -754,8 +912,14 @@ impl Digester {
     }
 
     /// Add a record batch; a refused batch leaves the digester as it was.
-    fn update(&mut self, py: Python<'_>, py_batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batch = import_record_batch(py_batch, self.include_metadata)?;
+    #[pyo3(signature = (py_batch, full_names))]
+    fn update(
+        &mut self,
+        py: Python<'_>,
+        py_batch: &Bound<'_, PyAny>,
+        full_names: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let batch = import_record_batch(py_batch, self.include_metadata, full_names)?;
         let digester = &mut self.digester;
         hashing(py, || digester.try_update(&batch))
     }
@@ -775,14 +939,18 @@ struct Prepared {
 #[pymethods]
 impl Prepared {
     #[new]
+    #[pyo3(signature = (
+        py_schema, include_metadata, ordered_columns, ordered_struct_fields, full_names
+    ))]
     fn new(
         py: Python<'_>,
         py_schema: &Bound<'_, PyAny>,
         include_metadata: bool,
         ordered_columns: bool,
         ordered_struct_fields: bool,
+        full_names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let schema = import_schema(py_schema, include_metadata)?;
+        let schema = import_schema(py_schema, include_metadata, full_names)?;
         let config = config(include_metadata, ordered_columns, ordered_struct_fields);
         Ok(Self {
             prepared: hashing(py, || PreparedSchema::try_new(&schema, config))?,
@@ -800,12 +968,15 @@ impl Prepared {
     }
 
     /// Hash one record batch of the prepared schema.
+    #[pyo3(signature = (py_batch, full_names))]
     fn hash_record_batch<'py>(
         &self,
         py: Python<'py>,
         py_batch: &Bound<'py, PyAny>,
+        full_names: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let batch = import_record_batch(py_batch, self.prepared.config().include_metadata)?;
+        let include_metadata = self.prepared.config().include_metadata;
+        let batch = import_record_batch(py_batch, include_metadata, full_names)?;
         let prepared = &self.prepared;
         let digest = hashing(py, || prepared.try_hash_record_batch(&batch))?;
         Ok(bytes(py, &digest))
@@ -813,22 +984,24 @@ impl Prepared {
 
     /// Hash a table of the prepared schema, given its schema and record batches. A table
     /// without batches hashes as one empty batch of its schema, so its schema is checked too.
+    #[pyo3(signature = (py_schema, batches, full_names))]
     fn hash_table<'py>(
         &self,
         py: Python<'py>,
         py_schema: &Bound<'py, PyAny>,
         batches: &Bound<'py, PyAny>,
+        full_names: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut digester = self.digester(py)?;
         let include_metadata = digester.include_metadata;
         let mut empty = true;
         for py_batch in batches.try_iter()? {
             empty = false;
-            let batch = import_record_batch(&py_batch?, include_metadata)?;
+            let batch = import_record_batch(&py_batch?, include_metadata, full_names)?;
             table_update(py, &mut digester.digester, &batch)?;
         }
         if empty {
-            let schema = import_schema(py_schema, include_metadata)?;
+            let schema = import_schema(py_schema, include_metadata, full_names)?;
             table_update(
                 py,
                 &mut digester.digester,

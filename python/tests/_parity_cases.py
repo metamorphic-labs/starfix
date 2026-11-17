@@ -118,6 +118,53 @@ def nested_dictionary_schema(depth: int) -> pa.Schema:
     return pa.schema([pa.field("d", t)])
 
 
+# --- field names containing NUL (the C Data Interface ends a name at the first NUL) ---------
+
+
+def nul_name_cases() -> dict[str, tuple[pa.Schema, pa.Schema, list[dict]]]:
+    """{case: (schema with NUL in names, the same schema with names cut at the NUL, rows)}."""
+    nul_struct = pa.struct([("x\x00y", pa.int64()), ("x", pa.string())])
+    cut_struct = pa.struct([("x", pa.int64()), ("x", pa.string())])
+    nul_map = pa.map_(pa.field("k\x00", pa.string(), nullable=False), pa.field("v\x00", pa.int64()))
+    cut_map = pa.map_(pa.field("k", pa.string(), nullable=False), pa.field("v", pa.int64()))
+    return {
+        "top": (
+            pa.schema([("a\x00b", pa.int64()), ("c", pa.int64())]),
+            pa.schema([("a", pa.int64()), ("c", pa.int64())]),
+            [{"a\x00b": 1, "c": 2}, {"a\x00b": None, "c": 3}],
+        ),
+        "top-beside-its-prefix": (
+            pa.schema([("a\x00b", pa.int64()), ("a", pa.int64())]),
+            pa.schema([("a", pa.int64()), ("a", pa.int64())]),
+            [{"a\x00b": 1, "a": 2}],
+        ),
+        "struct": (
+            pa.schema([("s", nul_struct)]),
+            pa.schema([("s", cut_struct)]),
+            [{"s": {"x\x00y": 1, "x": "p"}}, {"s": None}],
+        ),
+        "list-item": (
+            pa.schema([("l", pa.list_(pa.field("i\x00", pa.int64())))]),
+            pa.schema([("l", pa.list_(pa.field("i", pa.int64())))]),
+            [{"l": [1, 2]}, {"l": []}],
+        ),
+        "dictionary-of-struct": (
+            pa.schema([("d", pa.dictionary(pa.int8(), pa.struct([("z\x00", pa.int64())])))]),
+            pa.schema([("d", pa.dictionary(pa.int8(), pa.struct([("z", pa.int64())])))]),
+            [],
+        ),
+        "map-key-and-value": (pa.schema([("m", nul_map)]), pa.schema([("m", cut_map)]), [{"m": [("k", 1)]}]),
+    }
+
+
+def nul_name_batch(schema: pa.Schema, rows: list[dict]) -> pa.RecordBatch:
+    """The rows as a batch of `schema` (columns built one by one: names may repeat when cut)."""
+    if not rows:  # pyarrow 14 cannot convert [] to every type
+        return pa.RecordBatch.from_arrays([pa.nulls(0, field.type) for field in schema], schema=schema)
+    columns = [pa.array([list(row.values())[i] for row in rows], field.type) for i, field in enumerate(schema)]
+    return pa.RecordBatch.from_arrays(columns, schema=schema)
+
+
 # --- the differential's in-process cases --------------------------------------------------
 
 
@@ -147,4 +194,6 @@ def differential_cases() -> dict[str, tuple[pa.Schema, list[pa.RecordBatch]]]:
             nested_dictionary_schema(depth),
             [],
         )
+    for case_id, (schema, _, rows) in nul_name_cases().items():
+        cases[f"nul-name:{case_id}"] = (schema, [nul_name_batch(schema, rows)] if rows else [])
     return cases
