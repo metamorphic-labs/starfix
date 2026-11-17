@@ -1,6 +1,8 @@
 name: rust_checks
 on:
   - pull_request
+permissions:
+  contents: read
 jobs:
   rust-syntax-style-format-and-integration:
     runs-on: ubuntu-latest

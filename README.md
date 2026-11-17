@@ -12,9 +12,9 @@ Every hash is 35 bytes: a 3-byte **hash format version** followed by a SHA-256 d
 produces **hash format 2** (`00 00 02`). The exact bytes are specified in
 [`docs/byte-layout-spec.md`](docs/byte-layout-spec.md), precisely enough for an independent
 implementation. [starfix-python](https://github.com/metamorphic-labs/starfix-python) is such an
-implementation in pure Python; it matches the Rust-generated golden vectors in
-`tests/golden/format2_v0.5.json` exactly. This repository also builds a Python package from the
-crate (see [Python](#python)).
+implementation in pure Python (format 2 since its 0.5.0); it matches the Rust-generated golden
+vectors in `tests/golden/format2_v0.5.json` exactly. This repository also builds a Python
+package from the crate (see [Python](#python)).
 
 ## Usage
 
