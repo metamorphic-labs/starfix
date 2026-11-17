@@ -10,9 +10,9 @@ use std::{
 
 use arrow::{
     array::{
-        new_null_array, Array, AsArray as _, BooleanArray, FixedSizeListArray, GenericListArray,
-        LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, OffsetSizeTrait,
-        RecordBatch, StructArray,
+        make_array, new_null_array, Array, ArrayRef, AsArray as _, BooleanArray,
+        FixedSizeListArray, GenericListArray, LargeBinaryArray, LargeListArray, LargeStringArray,
+        ListArray, OffsetSizeTrait, RecordBatch, StructArray,
     },
     buffer::NullBuffer,
     compute::cast,
@@ -137,6 +137,14 @@ impl<D: Digest + Clone> EntryState<D> {
     }
 }
 
+/// The logical type of a node: a dictionary is its value type, resolved recursively.
+fn logical_type(data_type: &DataType) -> &DataType {
+    match data_type {
+        DataType::Dictionary(_, value_type) => logical_type(value_type),
+        other => other,
+    }
+}
+
 /// Recursively normalize a `DataType` to its canonical large equivalent.
 ///
 /// - `Utf8` → `LargeUtf8`
@@ -210,7 +218,9 @@ pub struct SchemaAnalysis<D: Digest> {
     /// One empty entry per node, in node-path order (byte-layout spec Section 3).
     entries_template: BTreeMap<String, DigestBufferType<D>>,
     /// The first type whose data cannot be hashed, if any (byte-layout spec Section 8).
-    unsupported_data_type: Option<DataType>,
+    /// With its node path (Section 3.1); the type is logical (dictionaries resolved), not
+    /// normalized.
+    unsupported_data_type: Option<(String, DataType)>,
 }
 
 impl<D: Digest + Clone> SchemaAnalysis<D> {
@@ -231,10 +241,9 @@ impl<D: Digest + Clone> SchemaAnalysis<D> {
 
         // Find a data type whose data cannot be hashed: the schema digest exists, but no data
         // of this schema can be hashed (`assert_data_supported`).
-        let unsupported_data_type = normalized
-            .fields
-            .iter()
-            .find_map(|field| ArrowDigesterCore::<D>::unsupported_data_type(field.data_type()));
+        let unsupported_data_type = schema.fields().iter().find_map(|field| {
+            ArrowDigesterCore::<D>::unsupported_data_type(field.data_type(), field.name())
+        });
 
         // Flatten all nested fields into a single map for per-field hashing
         let mut entries_template = BTreeMap::new();
@@ -258,9 +267,14 @@ impl<D: Digest + Clone> SchemaAnalysis<D> {
     /// # Errors
     /// On `Null`, `Map`, `Interval`, view and other unsupported types anywhere in the schema.
     pub fn check_data_supported(&self) -> Result<(), StarfixError> {
-        self.unsupported_data_type.as_ref().map_or(Ok(()), |other| {
-            Err(StarfixError::UnsupportedData(other.clone()))
-        })
+        self.unsupported_data_type
+            .as_ref()
+            .map_or(Ok(()), |(path, other)| {
+                Err(StarfixError::UnsupportedData {
+                    path: path.clone(),
+                    data_type: other.clone(),
+                })
+            })
     }
 
     pub const fn schema(&self) -> &SchemaRef {
@@ -486,7 +500,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         let normalized_type = normalize_data_type(&effective_type);
 
         Self::validate_type_paths(&normalized_type)?;
-        Self::validate_data_type(&normalized_type)?;
+        Self::validate_data_type(&effective_type)?;
 
         let mut final_digest = D::new();
         final_digest.update(header(KIND_ARRAY, flags));
@@ -961,7 +975,17 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                         fields,
                     );
                 }
-                let decoded = cast(array, value_type.as_ref()).expect("decode dictionary");
+                // Keys under a null enclosing struct are never read (Section 3.2), and pyarrow
+                // can leave them out of range: they are made null before the decoding.
+                let masked;
+                let keys = match ancestor_struct_nulls {
+                    Some(ancestor) if ancestor.null_count() > 0 => {
+                        masked = Self::with_hidden_keys_null(array, ancestor);
+                        masked.as_ref()
+                    }
+                    _ => array,
+                };
+                let decoded = cast(keys, value_type.as_ref()).expect("decode dictionary");
                 return Self::traverse_and_update(
                     value_type,
                     nullable,
@@ -1030,7 +1054,10 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         };
         let mut null_value = None;
         for (row, key) in keys.into_iter().enumerate() {
-            let value = if dictionary.keys().is_null(row) {
+            // A row under a null enclosing struct is never read (Section 3.2): its key, which
+            // pyarrow can leave out of range, is not looked up.
+            let hidden = ancestor_struct_nulls.is_some_and(|nulls| nulls.is_null(row));
+            let value = if hidden || dictionary.keys().is_null(row) {
                 Arc::clone(null_value.get_or_insert_with(|| new_null_array(values.data_type(), 1)))
             } else {
                 values.slice(key, 1)
@@ -1046,6 +1073,23 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             )?;
         }
         Ok(())
+    }
+
+    /// A dictionary whose keys are also null where `ancestor` is null: the same logical values at
+    /// every row that is read.
+    fn with_hidden_keys_null(array: &dyn Array, ancestor: &NullBuffer) -> ArrayRef {
+        let builder = array
+            .to_data()
+            .into_builder()
+            .nulls(Self::combine_nulls(array.nulls(), Some(ancestor)));
+        #[expect(
+            unsafe_code,
+            reason = "Only validity is added; arrow-rs would validate every key"
+        )]
+        // SAFETY: the buffers, offset, length and dictionary are the array's own, which is
+        // valid; only the validity changes, to a buffer of the same length with more nulls.
+        let data = unsafe { builder.build_unchecked() };
+        make_array(data)
     }
 
     /// A list node: [validity] and the lengths of its valid elements go into its own entry; the
@@ -1097,7 +1141,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     where
         O: OffsetSizeTrait,
     {
-        Self::check_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls)?;
+        Self::check_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls, path)?;
 
         let effective_nulls = Self::combine_nulls(list_array.nulls(), ancestor_struct_nulls);
         let entry = fields
@@ -1177,7 +1221,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .expect("downcast to FixedSizeListArray");
-        Self::check_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls)?;
+        Self::check_nulls_allowed(nullable, list_array.nulls(), ancestor_struct_nulls, path)?;
 
         let effective_nulls = Self::combine_nulls(list_array.nulls(), ancestor_struct_nulls);
         if nullable {
@@ -1256,6 +1300,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         own_nulls: Option<&NullBuffer>,
         ancestor: Option<&NullBuffer>,
+        path: &str,
     ) -> Result<(), StarfixError> {
         if nullable {
             return Ok(());
@@ -1268,7 +1313,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         if masked {
             Ok(())
         } else {
-            Err(StarfixError::NonNullableNull)
+            Err(StarfixError::NonNullableNull {
+                path: path.to_owned(),
+            })
         }
     }
 
@@ -1284,7 +1331,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             .downcast_ref::<StructArray>()
             .expect("downcast to StructArray");
 
-        Self::check_nulls_allowed(nullable, struct_array.nulls(), ancestor_struct_nulls)?;
+        Self::check_nulls_allowed(nullable, struct_array.nulls(), ancestor_struct_nulls, path)?;
 
         // Combine struct's own nulls with ancestor nulls (AND propagation)
         let combined_nulls = if nullable {
@@ -1339,7 +1386,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         ancestor_struct_nulls: Option<&NullBuffer>,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
-        Self::check_nulls_allowed(nullable, array.nulls(), ancestor_struct_nulls)?;
+        Self::check_nulls_allowed(nullable, array.nulls(), ancestor_struct_nulls, path)?;
         let entry = fields
             .get_mut(path)
             .expect("entry must exist for leaf path");
@@ -1565,19 +1612,30 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// # Errors
     /// On `Null`, `Map`, `Interval`, view and other unsupported types anywhere in the type tree.
     fn validate_data_type(data_type: &DataType) -> Result<(), StarfixError> {
-        Self::unsupported_data_type(data_type)
-            .map_or(Ok(()), |other| Err(StarfixError::UnsupportedData(other)))
+        Self::unsupported_data_type(data_type, "").map_or(Ok(()), |(path, other)| {
+            Err(StarfixError::UnsupportedData {
+                path,
+                data_type: other,
+            })
+        })
     }
 
-    /// The first type in the type tree whose data cannot be hashed (normalized), if any.
-    fn unsupported_data_type(data_type: &DataType) -> Option<DataType> {
-        match normalize_data_type(data_type) {
-            DataType::Struct(children) => children
-                .iter()
-                .find_map(|child| Self::unsupported_data_type(child.data_type())),
-            DataType::LargeList(element) | DataType::FixedSizeList(element, _) => {
-                Self::unsupported_data_type(element.data_type())
-            }
+    /// The first node of the type tree whose data cannot be hashed, if any: its node path
+    /// (`path` is the root's) and its logical type (dictionaries resolved, not normalized).
+    fn unsupported_data_type(data_type: &DataType, path: &str) -> Option<(String, DataType)> {
+        match logical_type(data_type) {
+            DataType::Struct(children) => children.iter().find_map(|child| {
+                Self::unsupported_data_type(
+                    child.data_type(),
+                    &Self::construct_field_name_hierarchy(path, child.name()),
+                )
+            }),
+            DataType::List(element)
+            | DataType::LargeList(element)
+            | DataType::FixedSizeList(element, _) => Self::unsupported_data_type(
+                element.data_type(),
+                &format!("{path}{DELIMITER_FOR_NESTED_FIELD}"),
+            ),
             DataType::Boolean
             | DataType::Int8
             | DataType::Int16
@@ -1601,9 +1659,11 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::FixedSizeBinary(_)
+            | DataType::Binary
             | DataType::LargeBinary
+            | DataType::Utf8
             | DataType::LargeUtf8 => None,
-            other => Some(other),
+            other => Some((path.to_owned(), other.clone())),
         }
     }
 
@@ -1651,7 +1711,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 | DataType::Union(_, _)
                 | DataType::RunEndEncoded(_, _)
         ) {
-            return Err(StarfixError::UnsupportedType);
+            return Err(StarfixError::UnsupportedType(
+                logical_type(data_type).clone(),
+            ));
         }
         match canonical {
             DataType::Struct(children) => {

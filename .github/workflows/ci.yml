@@ -27,31 +27,71 @@ jobs:
       run: cargo test --verbose
 
   python-binding:
-    # Builds the Python binding (python/starfix) and runs its tests, including the differential
-    # test against starfix-python, which needs its own environment (both import as "starfix").
+    # Builds the Python package (python/starfix, a PyO3 extension) and tests it: its own tests,
+    # the differential test against starfix-python 0.5.0 (PyPI), and starfix-python's own test
+    # suite at a pinned commit, run against this package (both import as "starfix", so
+    # starfix-python runs in its own environment). The floor leg runs the package's tests on the
+    # lowest supported Python and pyarrow.
+    name: python-binding (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: newest pyarrow
+            python: '3.13'
+            pyarrow: ''
+            parity: true
+          - name: floor, Python 3.10, pyarrow 14
+            python: '3.10'
+            pyarrow: '14.0.2'
+            parity: false
+    env:
+      # starfix-python's ITL-1177 branch (nauticalab/starfix-python PR #13); move with it.
+      STARFIX_PYTHON_COMMIT: ab8abff272dbfae82521fd494b41b2678321cd
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      if: matrix.parity
+      with:
+        repository: nauticalab/starfix-python
+        ref: ${{ env.STARFIX_PYTHON_COMMIT }}
+        path: starfix-python
+        persist-credentials: false
     - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
       with:
-        python-version: '3.12'
-    - name: Build and install the binding
+        python-version: ${{ matrix.python }}
+    - name: Build the wheel
       run: |
-        python -m venv .venv-binding
-        .venv-binding/bin/pip install "maturin[patchelf]>=1.9.6,<2" "pyarrow>=22" pytest
-        .venv-binding/bin/maturin build --out dist
-        .venv-binding/bin/pip install --no-deps dist/*.whl
-    - name: Install starfix-python for the differential test
+        python -m venv .venv-build
+        .venv-build/bin/pip install "maturin>=1.9.6,<2"
+        .venv-build/bin/maturin build --out dist
+    - name: Install the wheel into a clean environment
       run: |
-        PYARROW=$(.venv-binding/bin/python -c "import pyarrow; print(pyarrow.__version__)")
+        python -m venv .venv-starfix
+        .venv-starfix/bin/pip install dist/*.whl pytest
+        if [ -n "${{ matrix.pyarrow }}" ]; then
+          .venv-starfix/bin/pip install "pyarrow==${{ matrix.pyarrow }}" "numpy<2"
+        fi
+        .venv-starfix/bin/python -c "import pyarrow, starfix; print('starfix', starfix.__version__, starfix.__file__, 'pyarrow', pyarrow.__version__)"
+    - name: Install starfix-python 0.5.0 for the differential test
+      if: matrix.parity
+      run: |
+        PYARROW=$(.venv-starfix/bin/python -c "import pyarrow; print(pyarrow.__version__)")
         python -m venv .venv-starfix-python
         .venv-starfix-python/bin/pip install "pyarrow==${PYARROW}"
         .venv-starfix-python/bin/pip install --no-deps --require-hashes -r python/tests/starfix-python-requirements.txt
-    - name: Run the binding's tests
+    - name: The package's tests
       env:
-        STARFIX_PYTHON: ${{ github.workspace }}/.venv-starfix-python/bin/python
-        STARFIX_REQUIRE_DIFFERENTIAL: '1'
-      run: .venv-binding/bin/python -m pytest python/tests -ra
+        STARFIX_PYTHON: ${{ matrix.parity && format('{0}/.venv-starfix-python/bin/python', github.workspace) || '' }}
+        STARFIX_REQUIRE_DIFFERENTIAL: ${{ matrix.parity && '1' || '' }}
+      run: .venv-starfix/bin/python -m pytest python/tests -ra
+    - name: starfix-python's test suite against this package
+      if: matrix.parity
+      working-directory: starfix-python
+      env:
+        PYTHONPATH: ${{ github.workspace }}/python/tests/parity
+      run: ../.venv-starfix/bin/python -m pytest -p starfix_python_private_stub tests -rs
 
   verify-version-tag-sync:
     runs-on: ubuntu-latest

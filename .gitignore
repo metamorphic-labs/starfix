@@ -1,4 +1,4 @@
-# Maturin/uniffi generated files
+# Maturin build output (the extension module built in place)
 python/starfix/_internal
 python/starfix/*.so
 python/starfix/*.pyd

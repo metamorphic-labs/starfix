@@ -121,7 +121,9 @@ mod tests {
         assert_eq!(probe.finalize(), before);
         assert_eq!(
             digester.try_update(&refused),
-            Err(StarfixError::NonNullableNull)
+            Err(StarfixError::NonNullableNull {
+                path: "z/".to_owned()
+            })
         );
         let other = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("q", DataType::Int32, true)])),
@@ -134,7 +136,13 @@ mod tests {
         );
         // The panicking `update` refuses the same way and also leaves the digester unchanged.
         let message = panic_message(|| digester.clone().update(&refused));
-        assert_eq!(message, StarfixError::NonNullableNull.to_string());
+        assert_eq!(
+            message,
+            StarfixError::NonNullableNull {
+                path: "z/".to_owned()
+            }
+            .to_string()
+        );
         let mut after_panic = digester.clone();
         assert!(catch_unwind(AssertUnwindSafe(|| after_panic.update(&refused))).is_err());
         after_panic.update(&second);
@@ -161,28 +169,41 @@ mod tests {
         )]);
         assert_eq!(
             ArrowDigester::try_hash_schema(&union, config()),
-            Err(StarfixError::UnsupportedType)
+            Err(StarfixError::UnsupportedType(DataType::Union(
+                UnionFields::empty(),
+                UnionMode::Sparse
+            )))
         );
         let nulls = Schema::new(vec![Field::new("n", DataType::Null, true)]);
         ArrowDigester::try_hash_schema(&nulls, config()).unwrap();
         assert_eq!(
             ArrowDigester::try_new(&nulls, config()).err(),
-            Some(StarfixError::UnsupportedData(DataType::Null))
+            Some(StarfixError::UnsupportedData {
+                path: "n".to_owned(),
+                data_type: DataType::Null
+            })
         );
         assert_eq!(
             ArrowDigester::try_hash_array_with_config(&NullArray::new(2), config()),
-            Err(StarfixError::UnsupportedData(DataType::Null))
+            Err(StarfixError::UnsupportedData {
+                path: String::new(),
+                data_type: DataType::Null
+            })
         );
         let refused = batch(0, &[None]);
         assert_eq!(
             ArrowDigester::try_hash_record_batch(&refused, config()),
-            Err(StarfixError::NonNullableNull)
+            Err(StarfixError::NonNullableNull {
+                path: "z/".to_owned()
+            })
         );
 
         let prepared = PreparedSchema::try_new(&schema(), config()).unwrap();
         assert_eq!(
             prepared.try_hash_record_batch(&refused),
-            Err(StarfixError::NonNullableNull)
+            Err(StarfixError::NonNullableNull {
+                path: "z/".to_owned()
+            })
         );
         let other = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("q", DataType::Int32, true)])),
@@ -196,7 +217,10 @@ mod tests {
         let prepared_nulls = PreparedSchema::try_new(&nulls, config()).unwrap();
         assert_eq!(
             prepared_nulls.try_digester().err(),
-            Some(StarfixError::UnsupportedData(DataType::Null))
+            Some(StarfixError::UnsupportedData {
+                path: "n".to_owned(),
+                data_type: DataType::Null
+            })
         );
         assert_eq!(
             PreparedSchema::try_new(&duplicate, config()).err(),
@@ -257,7 +281,10 @@ mod tests {
             }),
             format!(
                 "not yet implemented: {}",
-                StarfixError::UnsupportedData(DataType::Null)
+                StarfixError::UnsupportedData {
+                    path: "n".to_owned(),
+                    data_type: DataType::Null
+                }
             )
         );
         let prepared = PreparedSchema::new(&schema(), config());

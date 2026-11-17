@@ -30,8 +30,15 @@ def options_of(vector: dict) -> dict:
 
 
 def read_ipc(vector: dict) -> tuple[pa.Schema, list[pa.RecordBatch]]:
-    reader = pa.ipc.open_stream(base64.b64decode(vector["ipc_b64"]))
-    return reader.schema, list(reader)
+    """The vector's input; skips the test when this pyarrow cannot decode it (older pyarrow
+    lacks newer types such as decimal32 or string_view)."""
+    try:
+        reader = pa.ipc.open_stream(base64.b64decode(vector["ipc_b64"]))
+        return reader.schema, list(reader)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as e:
+        import pytest
+
+        pytest.skip(f"pyarrow {pa.__version__} cannot read vector {vector['id']}: {e}")
 
 
 def rechunk(table: pa.Table, rng: random.Random) -> pa.Table:

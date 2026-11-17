@@ -60,10 +60,17 @@ def _binding_results(schema, batches, options):
 def _cases():
     """(id, table) pairs: every golden input in several chunks, and seeded random tables."""
     for v in golden_vectors():
-        schema, batches = read_ipc(v)
+        try:
+            schema, batches = read_ipc(v)
+        except pytest.skip.Exception:
+            continue  # this pyarrow cannot read the vector
         yield f"golden:{v['id']}", rechunk(pa.Table.from_batches(batches, schema=schema), random.Random(v["id"]))
     for seed in RANDOM_SEEDS:
         yield f"random:{seed}", random_table(seed)
+    # pyarrow's invalid array of a null struct over a dictionary child (an out-of-range key
+    # that is never read): both implementations must hash it alike.
+    hidden = pa.array([None, None], type=pa.struct([("x", pa.dictionary(pa.int32(), pa.string()))]))
+    yield "special:hidden-dictionary-key", pa.table({"s": hidden, "n": pa.array([1, 2])})
 
 
 def _starfix_python():

@@ -1,6 +1,4 @@
-/// Crate for starfix.
-extern crate uniffi as uniffi_external;
-uniffi_external::setup_scaffolding!();
+//! Crate for starfix.
 
 use std::fmt;
 use std::sync::Arc;
@@ -381,6 +379,7 @@ pub(crate) mod arrow_digester_core;
 mod error;
 pub use error::StarfixError;
 pub mod legacy;
-pub mod pyarrow;
+#[cfg(feature = "python")]
+mod python;
 
 // Write a test to check that int32 digest is consistent
