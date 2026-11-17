@@ -75,7 +75,22 @@ class BinaryPoint(pa.ExtensionType):
         return cls()
 
 
-for _extension_type in (Point(), BinaryPoint()):
+class NulNamedPoint(pa.ExtensionType):
+    """An extension type whose name and serialization contain NUL. Both travel in the export's
+    length-prefixed metadata, not in a C string, so they are not cut (as starfix-python)."""
+
+    def __init__(self):
+        super().__init__(pa.int64(), "starfix.test.nul\x00point")
+
+    def __arrow_ext_serialize__(self):
+        return b"v\x001"
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls()
+
+
+for _extension_type in (Point(), BinaryPoint(), NulNamedPoint()):
     try:
         pa.register_extension_type(_extension_type)
     except pa.ArrowKeyError:
@@ -158,7 +173,7 @@ def nested_dictionary_schema(depth: int) -> pa.Schema:
 
 
 def nul_name_cases() -> dict[str, tuple[pa.Schema, pa.Schema, list[dict]]]:
-    """{case: (schema with NUL in names, the same schema with names cut at the NUL, rows)}."""
+    """{case: (schema with NUL in names or time zones, the same schema cut at the NUL, rows)}."""
     nul_struct = pa.struct([("x\x00y", pa.int64()), ("x", pa.string())])
     cut_struct = pa.struct([("x", pa.int64()), ("x", pa.string())])
     nul_map = pa.map_(pa.field("k\x00", pa.string(), nullable=False), pa.field("v\x00", pa.int64()))
@@ -188,6 +203,16 @@ def nul_name_cases() -> dict[str, tuple[pa.Schema, pa.Schema, list[dict]]]:
             pa.schema([("d", pa.dictionary(pa.int8(), pa.struct([("z\x00", pa.int64())])))]),
             pa.schema([("d", pa.dictionary(pa.int8(), pa.struct([("z", pa.int64())])))]),
             [],
+        ),
+        "timestamp-time-zone": (
+            pa.schema([("t", pa.timestamp("us", tz="UTC\x00junk"))]),
+            pa.schema([("t", pa.timestamp("us", tz="UTC"))]),
+            [{"t": 0}, {"t": None}],
+        ),
+        "time-zone-in-struct": (
+            pa.schema([("s", pa.struct([("t", pa.timestamp("ms", tz="Europe/Paris\x00"))]))]),
+            pa.schema([("s", pa.struct([("t", pa.timestamp("ms", tz="Europe/Paris"))]))]),
+            [{"s": {"t": 1}}],
         ),
         "map-key-and-value": (pa.schema([("m", nul_map)]), pa.schema([("m", cut_map)]), [{"m": [("k", 1)]}]),
     }
@@ -250,6 +275,16 @@ def differential_cases() -> dict[str, tuple[pa.Schema, list[pa.RecordBatch]]]:
             nested_dictionary_schema(depth),
             [],
         )
+    nul_named = pa.ExtensionArray.from_storage(NulNamedPoint(), pa.array([1, None, 3]))
+    nul_metadata = pa.field("m", pa.int64(), metadata={"k\x00": "v\x00w"})
+    cases["nul-in-extension-name"] = (
+        pa.schema([pa.field("p", nul_named.type), nul_metadata]),
+        [
+            pa.RecordBatch.from_arrays(
+                [nul_named, pa.array([1, 2, 3])], schema=pa.schema([pa.field("p", nul_named.type), nul_metadata])
+            )
+        ],
+    )
     for case_id, batch in dictionary_of_point_batches().items():
         cases[f"extension-in-dictionary:{case_id}"] = (batch.schema, [batch])
     for case_id, batch in binary_metadata_cases().items():
