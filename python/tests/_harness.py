@@ -390,8 +390,9 @@ EXPECTED_DIFFERENCES = {
             "0.5.0 is wrong here (pyarrow take), fixed in 0.5.1: ITL-1223. pyarrow >= 17 take() "
             "and filter() return wrong values for a sliced fixed_size_list<fixed_size_list<...>> "
             "of outer size >= 2; 0.5.0 decodes a dictionary of nested values with take, so it "
-            "hashes other values than the input's. The binding hashes the input's values "
-            "(developer's decision, Nov 17).",
+            "hashes other values than the input's. The binding hashes the input's values. "
+            "Decided by the developer on 2026-11-17: 0.6.0 keeps the correct behaviour; 0.5.0 is "
+            "fixed in 0.5.1 (ITL-1223).",
             "other-digest",
             frozenset({"hash_table", "stream", "hash_record_batch", "hash_array"}),
         ),
