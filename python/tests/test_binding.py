@@ -21,7 +21,7 @@ import pyarrow as pa
 import pytest
 
 import starfix
-from _support import OPTION_SETS, golden_vectors, option_id, options_of, read_ipc, rechunk
+from _support import OPTION_SETS, array_options, golden_vectors, option_id, options_of, read_ipc, rechunk
 from starfix import ArrowDigester, PreparedSchema
 
 VECTORS = golden_vectors()
@@ -137,9 +137,7 @@ def test_golden_vector_in_several_chunks(v):
     schema, batches = read_ipc(v)
     table = rechunk(pa.Table.from_batches(batches, schema=schema), random.Random(v["id"]))
     if v["method"] == "hash_array":
-        got = ArrowDigester.hash_array(
-            table.column(0), ordered_columns=v["ordered_columns"], ordered_struct_fields=v["ordered_struct_fields"]
-        )
+        got = ArrowDigester.hash_array(table.column(0), **array_options(options_of(v)))
     else:
         got = ArrowDigester.hash_table(table, **options_of(v))
         assert ArrowDigester.prepare(schema, **options_of(v)).hash_table(table) == got
@@ -279,7 +277,9 @@ def test_repeated_metadata_keys_are_refused_with_include_metadata():
 
 # --- starfix-python's interface -----------------------------------------------------------
 
-_OPTIONS = ["include_metadata", "ordered_columns", "ordered_struct_fields"]
+# starfix-python's options, then the float options of this binding (ITL-1252), keyword-only
+# and off by default like the others.
+_OPTIONS = ["include_metadata", "ordered_columns", "ordered_struct_fields", "normalize_negative_zero", "normalize_nan"]
 
 
 @pytest.mark.parametrize(
@@ -349,8 +349,7 @@ def test_golden_vector_through_every_call(v):
         assert _streamed(ArrowDigester.prepare(schema, **options).digester(), batches) == got
     else:  # hash_array
         (batch,) = batches
-        array_options = {k: options[k] for k in _OPTIONS[1:]}
-        got = ArrowDigester.hash_array(batch.column(0), **array_options)
+        got = ArrowDigester.hash_array(batch.column(0), **array_options(options))
     assert got.hex() == v["expected_hash"]
 
 
@@ -490,7 +489,7 @@ def test_malformed_data_found_while_importing_raises_value_error():
     # PanicException, a BaseException.
     batch = pa.RecordBatch.from_pydict({"a": [1, 2], "b": ["x", "y"]})
     with pytest.raises(ValueError, match="Invalid Arrow data"):
-        starfix._internal.hash_record_batch(_ShortColumn(batch), False, False, False, None)
+        starfix._internal.hash_record_batch(_ShortColumn(batch), (False,) * 5, None)
 
 
 # --- the GIL is released while hashing ------------------------------------------------------

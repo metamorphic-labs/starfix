@@ -37,9 +37,9 @@ use std::{fs, io, slice};
 
 use arrow::array::{
     make_array, Array as _, ArrayData, ArrayRef, BooleanArray, DictionaryArray,
-    FixedSizeBinaryArray, Float32Array, Int32Array, Int32Builder, Int8Array, LargeListArray,
-    LargeStringArray, ListArray, ListBuilder, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, UInt8Array,
+    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int32Array, Int32Builder,
+    Int8Array, LargeListArray, LargeStringArray, ListArray, ListBuilder, RecordBatch,
+    RecordBatchOptions, StringArray, StructArray, UInt8Array,
 };
 use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow::compute::cast;
@@ -49,6 +49,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use half::f16;
 use serde::{Deserialize, Serialize};
 use starfix::{ArrowDigester, HasherConfig};
 
@@ -70,6 +71,7 @@ struct GoldenFixture {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "One field per option")]
 struct GoldenVector {
     id: String,
     description: String,
@@ -77,8 +79,22 @@ struct GoldenVector {
     include_metadata: bool,
     ordered_columns: bool,
     ordered_struct_fields: bool,
+    /// The float options (ITL-1252): written only when on, so every vector that does not set
+    /// them is serialized as before; absent means false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    normalize_negative_zero: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    normalize_nan: bool,
     ipc_b64: String,
     expected_hash: String,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -100,6 +116,8 @@ const fn cfg(flags: u8, include_metadata: bool) -> HasherConfig {
         include_metadata,
         ordered_columns: flags & 0x01 != 0,
         ordered_struct_fields: flags & 0x02 != 0,
+        normalize_negative_zero: false,
+        normalize_nan: false,
     }
 }
 
@@ -139,7 +157,11 @@ impl Builder {
         include_metadata: bool,
         input: &Input,
     ) {
-        let config = cfg(flags, include_metadata);
+        self.add_with(id, description, cfg(flags, include_metadata), input);
+    }
+
+    /// `add` with any options, the float options included.
+    fn add_with(&mut self, id: &str, description: &str, config: HasherConfig, input: &Input) {
         let (method, ipc, hash) = match input {
             Input::Schema(schema) => (
                 "hash_schema",
@@ -187,9 +209,11 @@ impl Builder {
             id: id.to_owned(),
             description: description.to_owned(),
             method: method.to_owned(),
-            include_metadata,
+            include_metadata: config.include_metadata,
             ordered_columns: config.ordered_columns,
             ordered_struct_fields: config.ordered_struct_fields,
+            normalize_negative_zero: config.normalize_negative_zero,
+            normalize_nan: config.normalize_nan,
             ipc_b64: ipc,
             expected_hash: hex::encode(hash),
         });
@@ -3901,6 +3925,295 @@ fn add_fixed_size_list_vectors(gen: &mut Builder) {
     );
 }
 
+// ── float options (ITL-1252) ────────────────────────────────────────────────
+
+/// The float values of the float-option vectors: name, description, and the bits as `Float16`,
+/// `Float32` and `Float64`.
+const FLOAT_VALUES: [(&str, &str, u16, u32, u64); 7] = [
+    (
+        "one_half",
+        "1.5",
+        0x3e00,
+        0x3fc0_0000,
+        0x3ff8_0000_0000_0000,
+    ),
+    (
+        "pos_zero",
+        "+0.0",
+        0x0000,
+        0x0000_0000,
+        0x0000_0000_0000_0000,
+    ),
+    (
+        "neg_zero",
+        "-0.0",
+        0x8000,
+        0x8000_0000,
+        0x8000_0000_0000_0000,
+    ),
+    (
+        "nan",
+        "NaN (quiet, no payload)",
+        0x7e00,
+        0x7fc0_0000,
+        0x7ff8_0000_0000_0000,
+    ),
+    (
+        "neg_nan",
+        "-NaN (quiet, sign set)",
+        0xfe00,
+        0xffc0_0000,
+        0xfff8_0000_0000_0000,
+    ),
+    (
+        "payload_nan",
+        "NaN with payload 0x2a",
+        0x7e2a,
+        0x7fc0_002a,
+        0x7ff8_0000_0000_002a,
+    ),
+    (
+        "signaling_nan",
+        "signaling NaN (payload 1)",
+        0x7c01,
+        0x7f80_0001,
+        0x7ff0_0000_0000_0001,
+    ),
+];
+
+/// Index of `pos_zero` and of the canonical `nan` in `FLOAT_VALUES`.
+const POS_ZERO: usize = 1;
+const NEG_ZERO: usize = 2;
+const CANONICAL_NAN: usize = 3;
+
+/// The four float option settings: id suffix, description, (negative zero, NaN).
+const FLOAT_OPTIONS: [(&str, &str, bool, bool); 4] = [
+    ("z0n0", "float options off", false, false),
+    ("z1n0", "normalize_negative_zero", true, false),
+    ("z0n1", "normalize_nan", false, true),
+    (
+        "z1n1",
+        "normalize_negative_zero and normalize_nan",
+        true,
+        true,
+    ),
+];
+
+const fn float_cfg(negative_zero: bool, nan: bool) -> HasherConfig {
+    HasherConfig {
+        include_metadata: false,
+        ordered_columns: false,
+        ordered_struct_fields: false,
+        normalize_negative_zero: negative_zero,
+        normalize_nan: nan,
+    }
+}
+
+/// A float array of `width` (16, 32 or 64) of the `FLOAT_VALUES` at `indices` (`None`: null).
+fn float_array(width: u8, indices: &[Option<usize>]) -> ArrayRef {
+    let value = |i: usize| FLOAT_VALUES.get(i).unwrap();
+    match width {
+        16 => Arc::new(Float16Array::from(
+            indices
+                .iter()
+                .map(|i| i.map(|k| f16::from_bits(value(k).2)))
+                .collect::<Vec<_>>(),
+        )),
+        32 => Arc::new(Float32Array::from(
+            indices
+                .iter()
+                .map(|i| i.map(|k| f32::from_bits(value(k).3)))
+                .collect::<Vec<_>>(),
+        )),
+        _ => Arc::new(Float64Array::from(
+            indices
+                .iter()
+                .map(|i| i.map(|k| f64::from_bits(value(k).4)))
+                .collect::<Vec<_>>(),
+        )),
+    }
+}
+
+/// `indices` with the values the options normalize replaced by their normal form: `-0.0` by
+/// `+0.0`, and every NaN by the canonical NaN.
+fn normalized_indices(
+    indices: &[Option<usize>],
+    negative_zero: bool,
+    nan: bool,
+) -> Vec<Option<usize>> {
+    indices
+        .iter()
+        .map(|i| {
+            i.map(|k| match k {
+                NEG_ZERO if negative_zero => POS_ZERO,
+                4..=6 if nan => CANONICAL_NAN,
+                other => other,
+            })
+        })
+        .collect()
+}
+
+/// The column `x` of a float-option vector: the values at the top level, as the items of a list
+/// (rows of 2, 3 and 3 items; one more row, null), or as the child `v` of a struct.
+fn float_column(form: &str, width: u8, indices: &[Option<usize>]) -> RecordBatch {
+    let values = float_array(width, indices);
+    let item = Field::new("item", values.data_type().clone(), true);
+    let column: ArrayRef = match form {
+        "top" => values,
+        "list" => Arc::new(ListArray::new(
+            Arc::new(item),
+            OffsetBuffer::from_lengths([2, 3, 3, 0]),
+            values,
+            Some(NullBuffer::from(vec![true, true, true, false])),
+        )),
+        _ => Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("v", values.data_type().clone(), true)]),
+            vec![values],
+            None,
+        )),
+    };
+    one_col("x", &column, true)
+}
+
+/// Golden vectors of the float options (ITL-1252): every special value alone at each width under
+/// each option setting; and a mixed column (1.5, both zeros, four NaNs, a null) at the top level,
+/// in a list and in a struct, under each setting, next to its normalized twins with the options
+/// off. With an option on, a value hashes as its normal form does with it off (relations
+/// `equal`); with it off, every value hashes differently (relations `different`).
+fn add_float_normalization_vectors(gen: &mut Builder) {
+    for (width, type_name) in [(16_u8, "Float16"), (32, "Float32"), (64, "Float64")] {
+        let w = format!("f{width}");
+        // each special value alone (one row), under each option setting
+        for (suffix, options_label, zero_on, nan_on) in FLOAT_OPTIONS {
+            let mut ids = Vec::new();
+            for (k, (name, label, ..)) in FLOAT_VALUES.iter().enumerate().skip(1) {
+                let id = format!("float_{w}_{name}_rb_{suffix}");
+                gen.add_with(
+                    &id,
+                    &format!("x: {type_name} non-null, one row {label}; {options_label}"),
+                    float_cfg(zero_on, nan_on),
+                    &Input::Batch(one_col("x", &float_array(width, &[Some(k)]), false)),
+                );
+                ids.push(id);
+            }
+            let id = |name: &str| format!("float_{w}_{name}_rb_{suffix}");
+            let nans = ["nan", "neg_nan", "payload_nan", "signaling_nan"].map(id);
+            match (zero_on, nan_on) {
+                (false, false) => gen.relate(
+                    "different",
+                    &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    "with the float options off every float is hashed by its bits: both zeros and every NaN differ",
+                ),
+                (true, false) => {
+                    gen.relate("equal", &[&id("pos_zero"), &id("neg_zero")], "normalize_negative_zero: -0.0 hashes as +0.0");
+                    gen.relate("different", &nans.iter().map(String::as_str).collect::<Vec<_>>(), "normalize_negative_zero leaves NaNs as they are");
+                }
+                (false, true) => {
+                    gen.relate("equal", &nans.iter().map(String::as_str).collect::<Vec<_>>(), "normalize_nan: every NaN hashes as the quiet NaN without sign or payload");
+                    gen.relate("different", &[&id("pos_zero"), &id("neg_zero")], "normalize_nan leaves -0.0 as it is");
+                }
+                (true, true) => {
+                    gen.relate("equal", &[&id("pos_zero"), &id("neg_zero")], "both float options: -0.0 hashes as +0.0");
+                    gen.relate("equal", &nans.iter().map(String::as_str).collect::<Vec<_>>(), "both float options: every NaN hashes as the canonical NaN");
+                }
+            }
+        }
+        // the options are not in the hash: with an option on, a value hashes as its normal form
+        // does with the options off
+        for name in ["pos_zero", "neg_zero"] {
+            gen.relate("equal", &[&format!("float_{w}_{name}_rb_z1n0"), &format!("float_{w}_pos_zero_rb_z0n0")], "the float options are not recorded in the hash: -0.0 with normalize_negative_zero hashes as +0.0 with the options off");
+        }
+        for name in ["nan", "neg_nan", "payload_nan", "signaling_nan"] {
+            gen.relate("equal", &[&format!("float_{w}_{name}_rb_z0n1"), &format!("float_{w}_nan_rb_z0n0")], "the float options are not recorded in the hash: a NaN with normalize_nan hashes as the canonical NaN with the options off");
+        }
+
+        // a mixed column at three depths
+        let mixed: Vec<Option<usize>> = vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            None,
+        ];
+        for (form, form_label) in [
+            ("top", format!("x: {type_name}")),
+            ("list", format!("x: List<{type_name}> rows [[1.5, +0.0], [-0.0, NaN, -NaN], [payload NaN, signaling NaN, null], null] (the items of the mixed column)")),
+            ("struct", format!("x: Struct<v: {type_name}> (v the mixed column)")),
+        ] {
+            let mixed_label = "1.5, +0.0, -0.0, NaN, -NaN, payload NaN, signaling NaN, null";
+            for (suffix, options_label, zero_on, nan_on) in FLOAT_OPTIONS {
+                gen.add_with(
+                    &format!("float_{w}_{form}_mixed_rb_{suffix}"),
+                    &format!("{form_label}; values {mixed_label}; {options_label}"),
+                    float_cfg(zero_on, nan_on),
+                    &Input::Batch(float_column(form, width, &mixed)),
+                );
+            }
+            for (twin, twin_label, zero_on, nan_on) in [
+                ("zeroed", "-0.0 replaced by +0.0", true, false),
+                ("nanned", "every NaN replaced by the canonical NaN", false, true),
+                ("canonical", "-0.0 replaced by +0.0 and every NaN by the canonical NaN", true, true),
+            ] {
+                gen.add(
+                    &format!("float_{w}_{form}_{twin}_rb_z0n0"),
+                    &format!("{form_label}; the mixed values with {twin_label}; float options off"),
+                    0x00,
+                    false,
+                    &Input::Batch(float_column(form, width, &normalized_indices(&mixed, zero_on, nan_on))),
+                );
+            }
+            let id = |name: &str| format!("float_{w}_{form}_{name}");
+            gen.relate("equal", &[&id("mixed_rb_z1n0"), &id("zeroed_rb_z0n0")], "normalize_negative_zero hashes as the data with -0.0 replaced by +0.0, options off");
+            gen.relate("equal", &[&id("mixed_rb_z0n1"), &id("nanned_rb_z0n0")], "normalize_nan hashes as the data with every NaN canonical, options off");
+            gen.relate("equal", &[&id("mixed_rb_z1n1"), &id("canonical_rb_z0n0")], "both float options hash as the normalized data, options off");
+            gen.relate("different", &[&id("mixed_rb_z0n0"), &id("zeroed_rb_z0n0"), &id("nanned_rb_z0n0"), &id("canonical_rb_z0n0")], "with the float options off -0.0 and NaN payloads are hashed as they are");
+            gen.relate("different", &[&id("mixed_rb_z0n0"), &id("mixed_rb_z1n0"), &id("mixed_rb_z0n1"), &id("mixed_rb_z1n1")], "each float option changes the hash of data it normalizes");
+        }
+
+        // hash_array of the mixed column
+        let mixed_array = float_array(
+            width,
+            &[Some(0), Some(2), Some(5), None, Some(1), Some(6), Some(4)],
+        );
+        for (suffix, options_label, zero_on, nan_on) in FLOAT_OPTIONS {
+            gen.add_with(
+                &format!("float_{w}_mixed_array_{suffix}"),
+                &format!("hash_array of a {type_name} array [1.5, -0.0, payload NaN, null, +0.0, signaling NaN, -NaN]; {options_label}"),
+                float_cfg(zero_on, nan_on),
+                &Input::Array(Arc::clone(&mixed_array)),
+            );
+        }
+        gen.add(
+            &format!("float_{w}_canonical_array_z0n0"),
+            &format!("hash_array of a {type_name} array [1.5, +0.0, NaN, null, +0.0, NaN, NaN]; float options off"),
+            0x00,
+            false,
+            &Input::Array(float_array(width, &[Some(0), Some(1), Some(3), None, Some(1), Some(3), Some(3)])),
+        );
+        gen.relate(
+            "equal",
+            &[
+                &format!("float_{w}_mixed_array_z1n1"),
+                &format!("float_{w}_canonical_array_z0n0"),
+            ],
+            "hash_array: both float options hash as the normalized array, options off",
+        );
+        gen.relate(
+            "different",
+            &[
+                &format!("float_{w}_mixed_array_z0n0"),
+                &format!("float_{w}_mixed_array_z1n0"),
+                &format!("float_{w}_mixed_array_z0n1"),
+                &format!("float_{w}_mixed_array_z1n1"),
+            ],
+            "hash_array: each float option changes the hash of an array it normalizes",
+        );
+    }
+}
+
 #[expect(clippy::panic, reason = "CLI tool — the append-only guard aborts")]
 fn check_append_only(vectors: &[GoldenVector], relations: &[Relation]) {
     let raw = match fs::read_to_string(FIXTURE_PATH) {
@@ -3938,6 +4251,7 @@ fn main() {
     dictionary_masked_struct_vectors(&mut g);
     dictionary_hidden_list_vectors(&mut g);
     add_fixed_size_list_vectors(&mut g);
+    add_float_normalization_vectors(&mut g);
     check_append_only(&g.vectors, &g.relations);
     let fixture = GoldenFixture {
         version: "0.5".to_owned(),

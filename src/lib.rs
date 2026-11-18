@@ -29,7 +29,16 @@ pub(crate) const VERSION_BYTES: [u8; 3] = [0_u8, 0_u8, 2_u8];
 /// order options never coincide; the header also names the entry point (schema, record batch or
 /// stream, array), so outputs of different entry points never coincide either (see
 /// `docs/byte-layout-spec.md`, Sections 1 and 6).
+///
+/// The float options `normalize_negative_zero` and `normalize_nan` are **not** recorded in the
+/// hash: with a float option on, data is hashed exactly as the same data with its float values
+/// normalized is hashed with the option off. Whether they were used is the caller's to know; do
+/// not mix hashes taken with different float options where bit-exact identity matters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent on/off options, each a keyword argument of the Python binding"
+)]
 pub struct HasherConfig {
     /// When `true`, schema-level and per-field Arrow metadata are included in the hash.
     /// Default is `false`.
@@ -41,6 +50,15 @@ pub struct HasherConfig {
     /// (struct in struct, list, large list, fixed-size list, map, dictionary value type).
     /// Default is `false`: reordering struct fields does not change the hash.
     pub ordered_struct_fields: bool,
+    /// When `true`, a `-0.0` value of a `Float16`, `Float32` or `Float64` leaf, at every nesting
+    /// depth, is hashed as `+0.0` (all bits zero). Not recorded in the hash.
+    /// Default is `false`: every float is hashed by its bits as is.
+    pub normalize_negative_zero: bool,
+    /// When `true`, every NaN value of a `Float16`, `Float32` or `Float64` leaf, at every nesting
+    /// depth (any sign, quiet or signaling, any payload), is hashed as the quiet NaN with a clear
+    /// sign bit and no payload (`0x7e00`, `0x7fc00000`, `0x7ff8000000000000`). Not recorded in
+    /// the hash. Default is `false`: every float is hashed by its bits as is.
+    pub normalize_nan: bool,
 }
 
 /// SHA-256 hasher of Arrow data, producing hash format 2 (`00 00 02 || SHA-256`, 35 bytes).

@@ -237,6 +237,7 @@ mod tests {
                 include_metadata: true,
                 ordered_columns: true,
                 ordered_struct_fields: true,
+                ..HasherConfig::default()
             },
         ] {
             assert_eq!(

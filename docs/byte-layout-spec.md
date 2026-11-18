@@ -43,7 +43,9 @@ flags = (ordered_columns ? 0x01 : 0) | (ordered_struct_fields ? 0x02 : 0)
 ```
 
 Bits 2–7 of `flags` are reserved and always 0. **Bit 2 (`0x04`) must never be used**: it briefly
-selected a never-released provisional option during the format-2 work.
+selected a never-released provisional option during the format-2 work. The float options
+(`normalize_negative_zero`, `normalize_nan`, Section 6) are **not** flags: they change only the
+value bytes of float leaves and are recorded nowhere in the hash.
 
 **Entry points never collide.** The SHA-256 input of each public output starts with its own
 header: `hash_schema` outputs `version || SHA-256(header('S', flags) || ...)`, record batches and
@@ -293,7 +295,7 @@ Example: `s: Struct<a: Int32 non-null>` nullable, rows `[{a:1}, null, {a:3}]` (c
 
 | Type | Bytes per valid value |
 |---|---|
-| Int8/UInt8, Int16/UInt16/Float16, Int32/UInt32/Float32/Date32/Time32/Decimal32, Int64/UInt64/Float64/Date64/Time64/Timestamp/Duration/Decimal64, Decimal128, Decimal256 | the value's 1, 2, 4, 8, 16, 32 little-endian bytes (IEEE 754 for floats; NaN payloads and -0.0 are hashed as is) |
+| Int8/UInt8, Int16/UInt16/Float16, Int32/UInt32/Float32/Date32/Time32/Decimal32, Int64/UInt64/Float64/Date64/Time64/Timestamp/Duration/Decimal64, Decimal128, Decimal256 | the value's 1, 2, 4, 8, 16, 32 little-endian bytes (IEEE 754 for floats; NaN payloads and -0.0 are hashed as is unless a float option is on, Section 6) |
 | FixedSizeBinary(n) | the n bytes (none for `n = 0`: the values item is then `SHA-256` of the empty string, as for any leaf without valid elements; validity and the row count still count) |
 | Boolean | one byte: `01` for true, `00` for false |
 | Utf8/LargeUtf8, Binary/LargeBinary | `length (u64) || bytes` (UTF-8 for strings) |
@@ -360,13 +362,43 @@ batch this check rejects.
 | `include_metadata` | Phase 2 (Section 2.3) |
 | `ordered_columns` | flags bit `0x01`; Phase 1 is the ordered array form (Section 2.2) |
 | `ordered_struct_fields` | flags bit `0x02`; struct children in declaration order (Section 2.1) |
+| `normalize_negative_zero` | not in the header; the value bytes of a float `-0.0` are those of `+0.0` (below) |
+| `normalize_nan` | not in the header; the value bytes of every float NaN are those of the canonical NaN (below) |
 
 Options are per call / per digester, never global; all default to false. Every entry point takes
-all of them (`hash_array` ignores `include_metadata`; `ordered_columns` changes only its header).
+all of them (`hash_array` ignores `include_metadata`; `ordered_columns` changes only its header;
+the float options do not change a schema digest).
 The order options change only the headers, Phase 1 and the `hash_array` `type_json`; entries are
 identical. Because the flags
 byte is part of the header, hashes taken with different order options never coincide (modulo
 SHA-256 collisions), even when order cannot matter.
+
+**Float options.** By default every value is hashed by its bytes as they are; starfix normalizes
+only the structural arrangement and encoding of Arrow data (Sections 2 and 3). The two float
+options change the value bytes (Section 3.2, item 3) of `Float16`, `Float32` and `Float64` leaves,
+at every depth (list, large list, fixed-size list, struct, dictionary values) and in `hash_array`:
+each valid value is replaced by its normal form before its bytes are hashed.
+
+| Option | Value (bits) | Hashed as |
+|---|---|---|
+| `normalize_negative_zero` | `-0.0`: sign bit set, every other bit 0 (`0x8000`, `0x80000000`, `0x8000000000000000`) | `+0.0`: all bits 0 |
+| `normalize_nan` | any NaN: exponent all ones, fraction non-zero, any sign (quiet or signaling, any payload) | the quiet NaN with a clear sign and no payload: `0x7e00` (Float16), `0x7fc00000` (Float32), `0x7ff8000000000000` (Float64) |
+
+Nothing else changes: null slots contribute nothing as before, the values of every other type
+(integers with the same bits, `FixedSizeBinary`, decimals) are hashed as they are, and the
+stored data is never modified. Hence, for every input (I6):
+
+```
+hash(data, options with a float option on) == hash(normalize(data), the same options with both float options off)
+```
+
+where `normalize` replaces every float value the option normalizes, at every depth, by its
+normal form. **Unlike the order options, the float options are not in the header** (nor anywhere
+else in the hash): a hash taken with a float option on can equal a hash taken with it off, for
+data that differs only in the values the option normalizes (the equality above). Whether a float
+option was used is the caller's to record; callers must not mix hashes taken with different
+float options where bit-exact identity matters. With both float options off every hash is the
+one of this format without them.
 
 ---
 
@@ -554,6 +586,8 @@ format-2 value.
 | I3 | `Utf8`≡`LargeUtf8`, `Binary`≡`LargeBinary`, `List`≡`LargeList`, dictionary≡plain, in every mode; `FixedSizeList<_, n>` is equivalent to nothing else (not `List`, not another size, not `FixedSizeBinary`). |
 | I4 | For every supported type: splitting rows into batches, slicing (non-zero offsets) and empty batches do not change the hash; adding or removing rows does; logically different data never collides (tested exhaustively on small inputs). |
 | I5 | Within one `flags` value, `include_metadata = true` without metadata equals `false`. |
+| I6 | Float options: hashing with `normalize_negative_zero` and/or `normalize_nan` on equals hashing, with both off, the data with the values they normalize replaced by their normal form (Section 6), for record batches, streams, a prepared schema and `hash_array`, at every nesting depth (tested as a property over generated tables: `tests/float_normalization.rs`, `python/tests/test_float_options.py`). |
+| I7 | The float options are not recorded in the hash: a hash taken with one on can equal a hash taken with it off (exactly for the data I6 relates). Unlike I2, hashes taken with different float options can coincide; do not mix them where bit-exact identity matters. |
 
 ---
 
@@ -575,6 +609,7 @@ were kept). From the release on it is append-only:
     { "id": "...", "description": "...",
       "method": "hash_schema | hash_record_batch | hash_stream | hash_array",
       "include_metadata": false, "ordered_columns": true, "ordered_struct_fields": false,
+      "normalize_negative_zero": true, "normalize_nan": true,
       "ipc_b64": "<base64 Arrow IPC stream>", "expected_hash": "000002..." }
   ],
   "relations": [ { "kind": "equal | different", "ids": ["...", "..."], "why": "..." } ]
@@ -607,6 +642,13 @@ slice offsets and trailing child positions on arrays it builds itself.
 
 A relation `equal` requires all listed vectors to have the same `expected_hash`; `different`
 requires them to be pairwise different.
+
+The keys `normalize_negative_zero` and `normalize_nan` (the float options, Section 6) appear only
+in vectors that set them to `true`; a vector without them has them off (every vector added before
+them, unchanged). The `float_*` vectors pin `+0.0`, `-0.0`, NaN, `-NaN`, a NaN with a payload and
+a signaling NaN at each float width, alone and mixed, at the top level, in a list, in a struct
+and through `hash_array`, under each float option setting (`z0n0`: both off, `z1n0`:
+`normalize_negative_zero`, `z0n1`: `normalize_nan`, `z1n1`: both), with relations for I6.
 
 ## 13. Platform considerations
 

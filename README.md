@@ -113,6 +113,8 @@ Differences from starfix-python:
   comparison (arrow-rs schema equality), starfix-python by comparing IPC bytes; both then fall
   back to the same schema-key comparison, so they accept and refuse the same batches.
 - Its private helpers (`starfix._format2`) do not exist.
+- Two more keyword options, `normalize_negative_zero` and `normalize_nan` (see Options), off by
+  default; with both off every hash is starfix-python's.
 
 ## What is hashed
 
@@ -122,7 +124,8 @@ Differences from starfix-python:
 - **The row count.**
 - **Every node of the type tree** (each column, struct field and list element): its validity if
   it is nullable, its lengths if it is a list, its values if it is a leaf. Booleans are hashed one
-  byte per value.
+  byte per value. Floats are hashed by their bits as they are (`-0.0` differs from `+0.0`, and
+  NaNs with different bits differ) unless a float option is on.
 
 **Ordering principle.** By default starfix ignores exactly two orders: the order of the
 top-level columns and the order of struct fields (at every depth). It never sorts or reorders
@@ -142,6 +145,8 @@ All options are per call (or per streaming digester), never global, and default 
 | `include_metadata` | schema-level and field-level metadata are part of the hash |
 | `ordered_columns` | the order of the top-level columns is part of the hash |
 | `ordered_struct_fields` | the order of struct fields is part of the hash, at every depth (struct in struct, list, large list, fixed-size list, map, dictionary value type) |
+| `normalize_negative_zero` | a `-0.0` value of a `Float16`, `Float32` or `Float64` leaf, at every depth, is hashed as `+0.0` |
+| `normalize_nan` | every NaN value of a float leaf (any sign, payload, quiet or signaling), at every depth, is hashed as the quiet NaN with a clear sign and no payload (`0x7e00`, `0x7fc00000`, `0x7ff8000000000000`) |
 
 ```rust
 // Identity of a table value whose column and struct-field order matter:
@@ -157,6 +162,26 @@ header that starts every digest. The header also names the entry point, so a sch
 record batch or stream hash and an array hash never coincide either. `hash_array` always treats
 the array as nullable (its validity is always hashed). Construct `HasherConfig` with `..HasherConfig::default()` to
 stay compatible with future options.
+
+**The float options are not recorded in the hash.** By default starfix hashes every value's bits
+as they are and normalizes only the structural arrangement and encoding of Arrow data, which is
+also the fastest. With `normalize_negative_zero` or `normalize_nan` on, data hashes exactly as the
+same data with those float values normalized hashes with the options off, so values that compare
+equal in Polars (`-0.0 == 0.0`, NaN == NaN) can hash equal. Unlike the order options they are not
+in the header: whether they were used is the caller's to know, and hashes taken with different
+float options must not be mixed where bit-exact identity matters. Null slots, every other type
+and the stored data are never changed. Cost with an option on: one scan of each float value
+buffer; a buffer with nothing to normalize is then hashed as with the options off
+(`examples/float_bench.rs`).
+
+```rust
+// -0.0 hashes as +0.0, and every NaN as the canonical NaN:
+let config = HasherConfig {
+    normalize_negative_zero: true,
+    normalize_nan: true,
+    ..HasherConfig::default()
+};
+```
 
 ## Rejected inputs
 
@@ -238,6 +263,8 @@ See `docs/byte-layout-spec.md`, Section 10, and the [CHANGELOG](CHANGELOG.md).
 - `tests/lossless_properties.rs`: every supported leaf type × nullability × position × row
   count, batch split, slicing and empty-vs-absent.
 - `tests/ordered_hashing.rs`, `tests/arrow_digester.rs`: options, rejections, invariants.
+- `tests/float_normalization.rs`: the float options, and the property that hashing with one on
+  equals hashing the normalized data with it off, over generated nested tables.
 
 Regenerate the golden file (append-only) with `cargo run --bin emit_golden_format2`.
 `tests/golden_vectors_format2.rs` also requires a minimum vector and relation count, so a
@@ -246,7 +273,8 @@ regeneration that drops vectors fails even if the generator was edited too.
 ### The Python package (`python/starfix`)
 
 `python/tests` holds the package's own tests (the golden vectors through every call, tables in
-several chunks, slices and empty tables, metadata, errors) and `test_differential.py`, which
+several chunks, slices and empty tables, metadata, errors, the float options in
+`test_float_options.py`) and `test_differential.py`, which
 compares every result with starfix-python 0.5.0 under all 8 option combinations. Both packages
 import as `starfix`, so starfix-python runs in its own environment, named by `STARFIX_PYTHON`
 (the test is skipped without it). `python/tests/parity` runs starfix-python's own test suite

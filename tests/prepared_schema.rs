@@ -53,6 +53,7 @@ mod tests {
                 include_metadata: bits & 0x04 != 0,
                 ordered_columns: bits & 0x01 != 0,
                 ordered_struct_fields: bits & 0x02 != 0,
+                ..HasherConfig::default()
             })
             .collect()
     }
@@ -139,12 +140,18 @@ mod tests {
     }
 
     #[derive(Deserialize)]
+    #[expect(clippy::struct_excessive_bools, reason = "One field per option")]
     struct GoldenVector {
         id: String,
         method: String,
         include_metadata: bool,
         ordered_columns: bool,
         ordered_struct_fields: bool,
+        /// The float options: absent (false) in every vector that does not set them.
+        #[serde(default)]
+        normalize_negative_zero: bool,
+        #[serde(default)]
+        normalize_nan: bool,
         ipc_b64: String,
         expected_hash: String,
     }
@@ -155,6 +162,8 @@ mod tests {
                 include_metadata: self.include_metadata,
                 ordered_columns: self.ordered_columns,
                 ordered_struct_fields: self.ordered_struct_fields,
+                normalize_negative_zero: self.normalize_negative_zero,
+                normalize_nan: self.normalize_nan,
             }
         }
     }

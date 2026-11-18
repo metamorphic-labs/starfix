@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Added — float options (ITL-1252)
+
+- `HasherConfig::normalize_negative_zero`: a `-0.0` value of a `Float16`, `Float32` or `Float64`
+  leaf, at every depth and in `hash_array`, is hashed as `+0.0`.
+- `HasherConfig::normalize_nan`: every NaN value of a float leaf (any sign or payload, quiet or
+  signaling) is hashed as the quiet NaN with a clear sign and no payload (`0x7e00`,
+  `0x7fc00000`, `0x7ff8000000000000`).
+- Both default to `false`: every value is hashed by its bits as before, and with both off every
+  hash is unchanged (format 2, the same header; every golden vector and the differential
+  harness against starfix-python 0.5.0 pass unchanged). With an option on, data hashes exactly
+  as the same data with those values normalized hashes with it off (byte-layout spec Section 6,
+  invariant I6), tested as a property over generated tables in Rust and through the harness's
+  seeded tables in Python. Null slots, every other type and the stored data are never changed.
+- **The float options are not recorded in the hash** (unlike the order options, they are not in
+  the header): do not mix hashes taken with different float options where bit-exact identity
+  matters (invariant I7).
+- Cost: with both options off the hashing path is the one before. With an option on, each float
+  value buffer is scanned once; a buffer with nothing to normalize is then hashed as with the
+  options off, otherwise its normalized bytes are hashed in 16 KiB blocks
+  (`examples/float_bench.rs`).
+- Python package: the keywords `normalize_negative_zero` and `normalize_nan` on every entry
+  point (`ArrowDigester(...)`, `prepare`, `hash_schema`, `hash_record_batch`, `hash_table`,
+  `hash_array`) and the `PreparedSchema` properties of the same names.
+- Golden vectors (`float_*`, appended): `+0.0`, `-0.0`, NaN, `-NaN`, payload and signaling NaNs at
+  each float width, alone and mixed, at the top level, in a list, in a struct and through
+  `hash_array`, under each float option setting. A vector sets the keys `normalize_negative_zero`
+  / `normalize_nan` only when `true`.
+- `HasherConfig` has two more fields: a struct literal that lists every field must add them
+  (`..HasherConfig::default()` keeps working).
+
 ### Added — prepared schema (ITL-1177)
 
 - `ArrowDigester::prepare(&schema, config)` / `PreparedSchema::new`: analyse a schema once and
