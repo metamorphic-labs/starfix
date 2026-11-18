@@ -1,9 +1,13 @@
 # Python wheels of this crate (python/starfix, a PyO3 extension module; ITL-1178).
 #
-# BUILD ONLY. This workflow builds the wheels and the sdist on every pull request and push, and
-# tests one wheel per operating system in a clean environment, so a broken wheel fails CI. It
-# publishes nothing: there is no publish job, token or trusted publisher here. Publishing to PyPI
-# is the developer's decision; what it needs is described at the end of this file.
+# This workflow builds the wheels and the sdist on every pull request and push, and tests one
+# wheel per operating system in a clean environment, so a broken wheel fails CI. Only a push of
+# a release tag v* publishes: first to TestPyPI, then to PyPI, and only when the job
+# `differential-harness` passed (100,000 seeded tables against starfix 0.5.0). That tag is
+# pushed by release.yml, which only the maintainer runs (RELEASING.md). Publishing uses trusted
+# publishing (OIDC), with no stored token. The publishers of the project "starfix" on TestPyPI and PyPI are registered for
+# owner metamorphic-labs, repository starfix, this workflow (maturin-release.yml) and the
+# environments testpypi and pypi.
 #
 # One wheel per platform covers every Python >= 3.10: the extension is built against the stable
 # ABI (abi3-py310, see Cargo.toml and pyproject.toml).
@@ -134,13 +138,73 @@ jobs:
           name: wheels-sdist
           path: dist
 
-# Publishing (not enabled; for the developer to decide and set up):
-#
-# The PyPI project "starfix" is currently published from metamorphic-labs/starfix-python. To
-# publish these wheels instead, a PyPI owner of "starfix" adds a trusted publisher for this
-# repository (owner metamorphic-labs, repository starfix, workflow maturin-release.yml, and a
-# GitHub environment such as "pypi"), and the developer adds a job here, run only for tags,
-# that downloads the artifacts above (actions/download-artifact) and uploads them with
-# pypa/gh-action-pypi-publish under `permissions: id-token: write` in that environment. The
-# trusted publisher of the other repository should then be removed. Version: maturin takes it
-# from Cargo.toml, which cargo-release bumps at release.
+  # The parity gate: the seeded differential harness against starfix-python 0.5.0 (PyPI,
+  # hash-pinned), release tier: 100,000 seeds in 8 shards on each leg (newest pyarrow; Python
+  # 3.10 with pyarrow 19), python/tests/test_harness.py via differential-harness.yml. The publish
+  # jobs need it, so a release tag publishes only if it passes. It runs for release tags: pull
+  # requests run the 2,000-seed tier (ci.yml), and main runs this tier nightly.
+  differential-harness:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/differential-harness.yml
+    with:
+      seeds: 100000
+      shards: '[0, 1, 2, 3, 4, 5, 6, 7]'
+
+  # The tag must name the version the wheels were built with (maturin takes it from Cargo.toml).
+  verify-tag:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - name: Cargo.toml version matches the tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "ERROR: tag v${TAG} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+
+  publish-testpypi:
+    name: publish to TestPyPI
+    needs: [verify-tag, differential-harness, linux, macos, windows, sdist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/starfix
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - name: Publish to TestPyPI
+        run: uv publish --trusted-publishing always --publish-url https://test.pypi.org/legacy/ dist/*
+
+  publish-pypi:
+    name: publish to PyPI
+    needs: [publish-testpypi]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/starfix
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always dist/*
