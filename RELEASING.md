@@ -36,12 +36,17 @@ branch or pushes a tag.
    `## Unreleased` section of `CHANGELOG.md` into `## <version> (<date>)`. `Cargo.lock` is not
    committed, so there is nothing else to change. It is merged like any other pull request, once
    the required checks pass.
-2. **Tag.** The maintainer tags that commit of `main` and pushes the tag, and only that tag:
+2. **Tag.** The maintainer tags the commit the bump pull request was merged as, and pushes the
+   tag, and only that tag. Take that commit from the pull request, not from the tip of `main`:
+   a pull request merged after the bump would otherwise be released with it, and the gates
+   would not notice (the version and the changelog are the same).
 
    ```sh
    git fetch origin
-   git log --oneline -1 origin/main   # the merged bump commit, <commit>
-   git tag -a v0.6.0 -m "starfix 0.6.0" <commit>
+   commit=$(gh pr view <bump pull request> --json mergeCommit --jq .mergeCommit.oid)
+   git merge-base --is-ancestor "$commit" refs/remotes/origin/main && echo "on main"
+   git show --stat "$commit"   # the bump: Cargo.toml and CHANGELOG.md
+   git tag -a v0.6.0 -m "starfix 0.6.0" "$commit"
    git push origin v0.6.0
    ```
 
@@ -68,8 +73,8 @@ Nothing is published unless every gate passed. The gates run on every release ta
 | Gate | Job |
 |---|---|
 | The tag is `v` + the version in `Cargo.toml` | `verify-tag` |
-| The tagged commit is on `main` (an ancestor of `origin/main`); a tag on any other commit publishes nothing | `verify-tag` |
-| `CHANGELOG.md` has the section `## <version>` | `verify-tag` |
+| The tagged commit is on `main` (an ancestor of `refs/remotes/origin/main`, named in full so that a tag called `origin/main` cannot stand in for it); a tag on any other commit publishes nothing | `verify-tag` |
+| `CHANGELOG.md` has the section `## <version>`, as a heading (a line inside a fenced code block does not count) | `verify-tag` |
 | The 100,000-seed differential harness against starfix 0.5.0 passes | `differential-harness` |
 | The wheels build and their tests pass in a clean environment (Linux glibc x86_64 and aarch64, macOS universal2, Windows x64; the musllinux wheels build but cannot be tested, as pyarrow has no musllinux wheels) | `linux …`, `macos universal2`, `windows x64` |
 | The sdist builds, and a wheel built from it alone passes the tests | `sdist` |
@@ -82,8 +87,16 @@ Then the three publications, each needing the previous one:
 
 1. **TestPyPI**, the rehearsal: the first upload of the release (trusted publishing, the files'
    metadata accepted by the index) happens where a mistake costs nothing.
-2. **crates.io**, the crate.
+2. **crates.io**, the crate. The job ends by reading the crates.io index until it lists the
+   version (every 15 seconds, for at most 10 minutes), and fails if it never does.
 3. **PyPI**, last, so PyPI never has a version whose crate is not on crates.io.
+
+Before each upload to TestPyPI and to PyPI, the job checks that `dist/` holds exactly the
+release's files: one wheel of the tagged version for each target the run builds (the table
+`RELEASE_WHEELS` of `release_checks.py`) and the sdist, and nothing else. A missing artifact
+fails the job before anything is uploaded, rather than publishing part of the release. (The
+check compares the file names with the tag's version as written, so a pre-release version, which
+maturin writes in its PEP 440 form, is refused there.)
 
 ## Publishing is trusted publishing (OIDC), with no stored token
 
@@ -100,8 +113,9 @@ answers 503). Each publish job is safe to run again for the same tag:
 - **crates.io.** The job first reads the crates.io sparse index
   (`https://index.crates.io/st/ar/starfix`, which lists every published version, yanked ones too).
   When it lists the version, the job says *"starfix <version> is already on crates.io: nothing to
-  upload"* and succeeds without authenticating or uploading. When the index cannot be read, the
-  job fails rather than guess.
+  upload"* and goes on without authenticating or uploading. Only a 404 (a crate never published)
+  counts as "not on crates.io"; any other status, an empty answer or a row without a version
+  fails the job rather than guess.
 - **TestPyPI and PyPI.** `uv publish --check-url <the index>` compares each file with the index
   before uploading it: a file already there with the same SHA-256 is skipped (*"File … already
   exists, skipping"*), a missing file is uploaded, and a file there with other contents is an
@@ -112,9 +126,15 @@ wheels and the sdist the first attempt built, so their hashes match what was alr
 Do not choose *Re-run all jobs* once something is published: the wheels would be built again, may
 differ byte for byte, and the index would then refuse them as different files of the same name.
 
-When a gate fails, nothing was published. Fix the cause through a pull request; then, as the tag
-must name a commit with the fix, delete the tag and tag the new commit of `main` (the version is
-unchanged, since nothing was published):
+When a gate fails, nothing was published. First decide whether the tagged commit is at fault:
+
+- **A transient failure** (the crates.io index answering 503 to the live tests of
+  `release-checks`, a network error, a lost runner): the same commit can pass. Open the run and
+  choose **Re-run failed jobs**. The tag stays where it is.
+- **A fix the commit needs** (a gate that refuses the commit itself, a failing test): fix the
+  cause through a pull request; then, as the tag must name a commit with the fix, delete the tag
+  and tag the new commit of `main`, as in step 2 (the version is unchanged, since nothing was
+  published):
 
 ```sh
 git push origin :refs/tags/v0.6.0   # delete the remote tag
