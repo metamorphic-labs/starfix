@@ -263,4 +263,5 @@ PYTHONPATH=$OLDPWD/python:$OLDPWD/python/tests/parity python -m pytest -p starfi
 
 CI runs these against a built wheel (`.github/workflows/ci.yml`, job `python-binding`, also on
 Python 3.10 with pyarrow 14), and `.github/workflows/maturin-release.yml` builds and tests the
-wheels of every platform (it publishes nothing).
+wheels of every platform; only a release tag `v*` publishes them, to TestPyPI and then PyPI
+(see [RELEASING.md](RELEASING.md)).
