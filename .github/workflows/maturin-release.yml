@@ -14,7 +14,8 @@
 #   crate-package         the crate packages and builds (cargo publish --dry-run), cargo test.
 # Then, in this order (each publication needs the previous one):
 #   1. TestPyPI   the rehearsal: the first upload, to a registry where a mistake costs nothing;
-#   2. crates.io  the crate; the job succeeds only once the crates.io index lists the version;
+#   2. crates.io  the crate; the job succeeds only once the crates.io index lists the version,
+#                 not yanked;
 #   3. PyPI       last, so PyPI never has a version whose crate is not on crates.io.
 # Before each upload to TestPyPI and PyPI, the downloaded files are checked to be exactly the
 # release's: one wheel of the tagged version per target built above, and the sdist.
@@ -275,7 +276,8 @@ jobs:
   # 2. crates.io. The sparse index lists every published version (yanked ones too); when it lists
   # this one, the job says so and uploads nothing, so a re-run after a publication succeeds.
   # Either way the job ends by waiting (at most 10 minutes) until the index lists the version,
-  # so PyPI does not start before the crate is available to Cargo.
+  # not yanked, so PyPI does not start before the crate is available to Cargo (a yanked version
+  # fails the job at once: Cargo does not select it, so PyPI is not published).
   publish-crate:
     name: publish to crates.io
     needs: [verify-tag, crate-package, differential-harness, linux, macos, windows, sdist, publish-testpypi]

@@ -12,8 +12,9 @@
                      re-run of the publish job skips an upload that already happened. Exit 1 when
                      the index cannot be read: an unknown answer never counts as "not published".
   wait-crate-listed  After the crate upload (or when it was already there): poll the sparse index
-                     until it lists <name> <version>, so PyPI never starts before the crate is
-                     available to Cargo. Exit 1 when it is not listed within --timeout seconds.
+                     until it lists <name> <version> not yanked, so PyPI never starts before the
+                     crate is available to Cargo. Exit 1 when it is not listed within --timeout
+                     seconds, and at once when it is listed as yanked.
 
 The crates.io sparse index answers, as read here: 200 with rows that are all JSON objects with a
 string "vers": the versions listed; 404: the crate has never been published, so not published;
@@ -62,6 +63,10 @@ DISTRIBUTION = "starfix"
 
 class ReleaseCheckError(Exception):
     """A gate refused, or a check could not get an answer."""
+
+
+class CrateYankedError(ReleaseCheckError):
+    """crates.io lists the version as yanked: Cargo does not select it for a new lockfile."""
 
 
 def cargo_version(path: Path | str) -> str:
@@ -159,30 +164,55 @@ def http_get(url: str, attempts: int = 3) -> tuple[int, str]:
     raise ReleaseCheckError(f"could not read {url}: {last}")
 
 
-def crate_version_published(name: str, version: str, fetch: Fetch = http_get) -> bool:
-    """Whether crates.io lists the version (yanked or not). Unknown answers raise.
+def crate_index_rows(name: str, fetch: Fetch = http_get) -> dict[str, list[dict]]:
+    """The crate's sparse index rows by version ({} for a crate never published). Unknown answers
+    raise.
 
-    404 (the crate was never published) is "not published". 200 needs at least one row, and every
-    row a JSON object with a string "vers"; anything else, and any other status, raises."""
+    404 (the crate was never published) is no rows. 200 needs at least one row, and every row a
+    JSON object with a string "vers"; anything else, and any other status, raises."""
     url = f"{CRATES_INDEX}/{crates_index_path(name)}"
     status, body = fetch(url)
     if status == 404:
-        return False
+        return {}
     if status != 200:
         raise ReleaseCheckError(f"{url} answered HTTP {status}")
     rows = [line for line in body.splitlines() if line.strip()]
     if not rows:
         raise ReleaseCheckError(f"{url} answered HTTP 200 with no index rows")
-    versions = set()
+    versions: dict[str, list[dict]] = {}
     for row in rows:
         try:
-            vers = json.loads(row)["vers"]
+            entry = json.loads(row)
+            vers = entry["vers"]
         except (ValueError, KeyError, TypeError, IndexError) as e:
             raise ReleaseCheckError(f"{url} is not a sparse index file: {e!r}") from e
         if not isinstance(vers, str):
             raise ReleaseCheckError(f"{url} has a row whose version is not a string: {row[:200]}")
-        versions.add(vers)
-    return version in versions
+        versions.setdefault(vers, []).append(entry)
+    return versions
+
+
+def crate_version_published(name: str, version: str, fetch: Fetch = http_get) -> bool:
+    """Whether crates.io lists the version, yanked or not: a yanked version can never be uploaded
+    again, so it counts as published for the decision to upload. Unknown answers raise."""
+    return version in crate_index_rows(name, fetch=fetch)
+
+
+def crate_version_available(name: str, version: str, fetch: Fetch = http_get) -> bool:
+    """Whether crates.io lists the version, not yanked. False when it is not listed; raises
+    CrateYankedError when it is listed as yanked, and ReleaseCheckError for an unknown answer
+    (also a "yanked" field that is not a boolean)."""
+    entries = crate_index_rows(name, fetch=fetch).get(version)
+    if not entries:
+        return False
+    yanked = [entry.get("yanked") for entry in entries]
+    if any(y is True for y in yanked):
+        raise CrateYankedError(
+            f"crates.io lists {name} {version} as yanked: Cargo does not select it for a new lockfile"
+        )
+    if not all(y is False for y in yanked):
+        raise ReleaseCheckError(f"the crates.io index row of {name} {version} has no boolean 'yanked'")
+    return True
 
 
 def wait_for_crate_version(
@@ -194,15 +224,18 @@ def wait_for_crate_version(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Poll the sparse index until it lists the version; raise if it does not within timeout
-    seconds. An error while polling is not a yes: it is retried, and named if time runs out."""
+    """Poll the sparse index until it lists the version, not yanked; raise if it does not within
+    timeout seconds. An error while polling is not a yes: it is retried, and named if time runs
+    out. A yanked version raises CrateYankedError at once: waiting would not change it."""
     start = clock()
     last = "the index does not list it"
     while True:
         try:
-            if crate_version_published(name, version, fetch=fetch):
+            if crate_version_available(name, version, fetch=fetch):
                 return
             last = "the index does not list it"
+        except CrateYankedError:
+            raise
         except ReleaseCheckError as e:
             last = str(e)
         if clock() - start + interval > timeout:
@@ -327,6 +360,9 @@ def cmd_dist_complete(args: argparse.Namespace) -> int:
 def cmd_wait_crate_listed(args: argparse.Namespace, fetch: Fetch) -> int:
     try:
         wait_for_crate_version(args.name, args.version, fetch=fetch, timeout=args.timeout, interval=args.interval)
+    except CrateYankedError as e:
+        _error(f"{e}. PyPI publication is blocked: a yanked crate is not released.")
+        return 1
     except ReleaseCheckError as e:
         _error(f"{e}. PyPI was not started; re-run the failed jobs once crates.io lists it.")
         return 1

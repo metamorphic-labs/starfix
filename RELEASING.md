@@ -88,7 +88,10 @@ Then the three publications, each needing the previous one:
 1. **TestPyPI**, the rehearsal: the first upload of the release (trusted publishing, the files'
    metadata accepted by the index) happens where a mistake costs nothing.
 2. **crates.io**, the crate. The job ends by reading the crates.io index until it lists the
-   version (every 15 seconds, for at most 10 minutes), and fails if it never does.
+   version (every 15 seconds, for at most 10 minutes), and fails if it never does. If the index
+   lists the version as yanked, the job fails at once and PyPI is not published: Cargo does not
+   select a yanked version for a new lockfile. (Yanked versions still count as published for the
+   decision to upload, as a version can never be uploaded twice.)
 3. **PyPI**, last, so PyPI never has a version whose crate is not on crates.io.
 
 Before each upload to TestPyPI and to PyPI, the job checks that `dist/` holds exactly the

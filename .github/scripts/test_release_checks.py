@@ -329,6 +329,7 @@ class FakeClock:
 
 class WaitForCrateVersionTest(unittest.TestCase):
     INDEX_WITHOUT = '{"name":"starfix","vers":"0.5.0","yanked":false}\n'
+    INDEX_LISTED = INDEX_WITHOUT + '{"name":"starfix","vers":"0.6.0","yanked":false}\n'
 
     def wait(self, fetch, clock, timeout=60, interval=10):
         rc.wait_for_crate_version(
@@ -337,21 +338,21 @@ class WaitForCrateVersionTest(unittest.TestCase):
 
     def test_returns_at_once_when_the_version_is_listed(self):
         clock = FakeClock()
-        fetch = fetch_sequence((200, INDEX))
+        fetch = fetch_sequence((200, self.INDEX_LISTED))
         self.wait(fetch, clock)
         self.assertEqual(len(fetch.calls), 1)
         self.assertEqual(clock.sleeps, [])
 
     def test_polls_until_the_version_is_listed(self):
         clock = FakeClock()
-        fetch = fetch_sequence((200, self.INDEX_WITHOUT), (200, self.INDEX_WITHOUT), (200, INDEX))
+        fetch = fetch_sequence((200, self.INDEX_WITHOUT), (200, self.INDEX_WITHOUT), (200, self.INDEX_LISTED))
         self.wait(fetch, clock)
         self.assertEqual(len(fetch.calls), 3)
         self.assertEqual(clock.sleeps, [10, 10])
 
     def test_an_unreadable_answer_while_waiting_is_not_a_yes(self):
         clock = FakeClock()
-        fetch = fetch_sequence(rc.ReleaseCheckError("HTTP 503"), (200, ""), (200, INDEX))
+        fetch = fetch_sequence(rc.ReleaseCheckError("HTTP 503"), (200, ""), (200, self.INDEX_LISTED))
         self.wait(fetch, clock)
         self.assertEqual(len(fetch.calls), 3)
 
@@ -363,6 +364,23 @@ class WaitForCrateVersionTest(unittest.TestCase):
         self.assertLessEqual(clock.now, 60)
         self.assertEqual(len(fetch.calls), 7)  # at 0, 10, ..., 60 seconds
 
+    def test_a_yanked_version_fails_at_once(self):
+        # Cargo does not select a yanked version for a new lockfile, so PyPI must not follow it.
+        clock = FakeClock()
+        fetch = fetch_sequence((200, self.INDEX_WITHOUT), (200, INDEX))  # INDEX: 0.6.0 is yanked
+        with self.assertRaisesRegex(rc.CrateYankedError, "yanked"):
+            self.wait(fetch, clock)
+        self.assertEqual(len(fetch.calls), 2)
+        self.assertEqual(clock.sleeps, [10])
+
+    def test_a_yanked_flag_that_is_not_a_boolean_is_not_a_yes(self):
+        for yanked in ("null", '"false"', "0"):
+            clock = FakeClock()
+            body = self.INDEX_WITHOUT + '{"name":"starfix","vers":"0.6.0","yanked":%s}\n' % yanked
+            with self.subTest(yanked=yanked), self.assertRaises(rc.ReleaseCheckError) as caught:
+                self.wait(fetch_sequence((200, body)), clock, timeout=20, interval=10)
+            self.assertNotIsInstance(caught.exception, rc.CrateYankedError)
+
     def test_the_failure_names_the_last_error(self):
         clock = FakeClock()
         fetch = fetch_sequence(rc.ReleaseCheckError("HTTP 503"))
@@ -371,6 +389,18 @@ class WaitForCrateVersionTest(unittest.TestCase):
 
 
 class WaitCrateCommandTest(unittest.TestCase):
+    def test_exit_1_when_the_version_is_yanked(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = rc.main(
+                ["wait-crate-listed", "--name", "starfix", "--version", "0.6.0", "--timeout", "600"],
+                fetch=fake_fetch(200, INDEX),
+            )
+        self.assertEqual(status, 1)
+        self.assertIn("::error::", out.getvalue())
+        self.assertIn("yanked", out.getvalue())
+        self.assertIn("PyPI", out.getvalue())
+
     def test_exit_0_when_listed(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
