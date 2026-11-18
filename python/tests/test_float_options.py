@@ -189,6 +189,10 @@ def test_seeded_tables_hash_with_an_option_as_their_normalized_twin_with_the_opt
     names, metadata, slices, nulls, batches, invalid data); only the float values the option
     normalizes differ. Every call under the first and last option sets must agree: equal digests,
     or a refusal of the same class on both."""
+    if int(pa.__version__.split(".")[0]) < 19:
+        # The harness's floor is pyarrow 19 (starfix-python 0.5.0's): on pyarrow 14 building its
+        # seeded inputs crashes pyarrow itself (a segfault after some cases, with no starfix call).
+        pytest.skip(f"the harness needs pyarrow >= 19, not {pa.__version__}")
     option_sets = [OPTION_SETS[0], OPTION_SETS[-1]]
     with_option = [{**options, **_kw(setting)} for options in option_sets]
     failures, differing, compared = [], 0, 0

@@ -58,6 +58,15 @@ mod tests {
             }
         }
 
+        /// Bytes per value.
+        const fn bytes(self) -> usize {
+            match self {
+                Self::F16 => 2,
+                Self::F32 => 4,
+                Self::F64 => 8,
+            }
+        }
+
         /// (sign bit, exponent mask, fraction mask, canonical quiet NaN).
         const fn layout(self) -> (u64, u64, u64, u64) {
             match self {
@@ -594,6 +603,56 @@ mod tests {
                         assert_eq!(
                             prepared.schema_digest(),
                             ArrowDigester::hash_schema(&schema, off)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Float values around and across the 16 KiB blocks in which the normalized bytes are hashed:
+    /// valid-value byte counts just below, at and just above one block, two blocks, and three
+    /// blocks with a partial tail; without nulls and with a null after every fourth valid value;
+    /// every entry point, the stream split inside a block.
+    #[test]
+    fn normalized_bytes_across_block_boundaries() {
+        const BLOCK: usize = 0x4000;
+        for width in Width::ALL {
+            let per_block = BLOCK.checked_div(width.bytes()).unwrap();
+            let counts = [
+                per_block.checked_sub(1).unwrap(),
+                per_block,
+                per_block.checked_add(1).unwrap(),
+                per_block.checked_mul(2).unwrap(),
+                per_block.checked_mul(3).unwrap().checked_add(5).unwrap(),
+            ];
+            let values = width.values();
+            for valid_count in counts {
+                for with_nulls in [false, true] {
+                    let mut bits = Vec::new();
+                    let mut valid = Vec::new();
+                    for k in 0..valid_count {
+                        let index = k.checked_rem(values.len()).unwrap();
+                        bits.push(values.get(index).copied().unwrap());
+                        valid.push(true);
+                        if with_nulls && k.checked_rem(4) == Some(3) {
+                            bits.push(values.get(1).copied().unwrap()); // -0.0 in a null slot
+                            valid.push(false);
+                        }
+                    }
+                    let split = bits.len().checked_div(3).unwrap();
+                    let nulls = with_nulls.then(|| NullBuffer::from(valid));
+                    let batch = one_column(&width.array(&bits, nulls));
+                    for flags in ON {
+                        let why = format!(
+                            "{} {valid_count} valid values, nulls {with_nulls}, zero {} nan {}",
+                            width.data_type(),
+                            flags.negative_zero,
+                            flags.nan
+                        );
+                        assert!(
+                            check_invariant(&batch, flags, (false, false), split, &why),
+                            "{why}: the option must change this hash"
                         );
                     }
                 }
