@@ -508,6 +508,8 @@ The format version is independent of the library's package version.
 
 Hash format 2 is documented byte-for-byte and validated against a set of golden test vectors.
 
+A hash in a given format is stable: every release that implements hash format 2 produces the same format-2 hash for the same logical data and the same options, on any little-endian platform, in both the Rust crate and the Python package. A change that would alter an existing digest gets a new format number. The golden vectors and a differential test against starfix-python 0.5.0 check this on every pull request; the one recorded difference is the starfix-python 0.5.0 defect described below. The floating-point normalization options are the one setting not recorded in the hash: see the **Important** note under *Floating-point normalization*.
+
 ### Cross-language compatibility
 
 The Rust implementation and the corresponding format-2 `starfix-python` implementation produce identical hashes for the defined format, with one known exception: `starfix-python` 0.5.0 hashes a dictionary of sliced nested fixed-size lists incorrectly (a pyarrow `take()` defect).
