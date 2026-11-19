@@ -1,13 +1,32 @@
-# Python wheels of this crate (python/starfix, a PyO3 extension module; ITL-1178).
+# The release workflow of starfix: the Python wheels and sdist (python/starfix, a PyO3
+# extension module; ITL-1178) and the crate (ITL-1233). RELEASING.md describes the release.
 #
-# This workflow builds the wheels and the sdist on every pull request and push, and tests one
-# wheel per operating system in a clean environment, so a broken wheel fails CI. Only a push of
-# a release tag v* publishes: first to TestPyPI, then to PyPI, and only when the job
-# `differential-harness` passed (100,000 seeded tables against starfix 0.5.0). That tag is
-# pushed by release.yml, which only the maintainer runs (RELEASING.md). Publishing uses trusted
-# publishing (OIDC), with no stored token. The publishers of the project "starfix" on TestPyPI and PyPI are registered for
-# owner metamorphic-labs, repository starfix, this workflow (maturin-release.yml) and the
-# environments testpypi and pypi.
+# On every pull request and push it builds the wheels and the sdist and tests them in a clean
+# environment, packages the crate (cargo publish --dry-run) and tests the release gate script.
+#
+# A push of a release tag v<version>, which only the maintainer pushes, on a commit of main, also
+# publishes. Nothing is published unless every gate passed first:
+#   verify-tag            the tag is v<Cargo.toml version>, the tagged commit is on main (an
+#                         ancestor of refs/remotes/origin/main), CHANGELOG.md has the section
+#                         "## <version>";
+#   differential-harness  100,000 seeded tables against starfix-python 0.5.0;
+#   linux, macos, windows, sdist   the wheels and the sdist build and their tests pass;
+#   crate-package         the crate packages and builds (cargo publish --dry-run), cargo test.
+# Then, in this order (each publication needs the previous one):
+#   1. TestPyPI   the rehearsal: the first upload, to a registry where a mistake costs nothing;
+#   2. crates.io  the crate; the job succeeds only once the crates.io index lists the version,
+#                 not yanked;
+#   3. PyPI       last, so PyPI never has a version whose crate is not on crates.io.
+# Before each upload to TestPyPI and PyPI, the downloaded files are checked to be exactly the
+# release's: one wheel of the tagged version per target built above, and the sdist.
+# A publication cannot be undone, and a run can fail half way, so each publish job is safe to
+# re-run: it skips what its registry already has (crates.io: the sparse index; TestPyPI and
+# PyPI: uv publish --check-url, file by file). "Re-run failed jobs" completes a half-done release.
+#
+# No workflow commits, pushes a branch or pushes a tag. Publishing uses trusted publishing (OIDC),
+# with no stored token: the publishers of crates.io (crate starfix, environment crates), TestPyPI
+# and PyPI (project starfix, environments testpypi and pypi) are registered for owner
+# metamorphic-labs, repository starfix and this workflow file, maturin-release.yml.
 #
 # One wheel per platform covers every Python >= 3.10: the extension is built against the stable
 # ABI (abi3-py310, see Cargo.toml and pyproject.toml).
@@ -133,16 +152,52 @@ jobs:
           python -m venv .venv-build
           .venv-build/bin/pip install "maturin>=1.9.6,<2"
           .venv-build/bin/maturin sdist --out dist
+      # pip builds a wheel from the sdist alone (the Rust toolchain of the runner), so a file
+      # missing from the sdist fails here, not for a user installing from source.
+      - name: Test the sdist in a clean environment
+        run: |
+          python -m venv .venv-test
+          .venv-test/bin/pip install dist/*.tar.gz pytest
+          .venv-test/bin/python -m pytest python/tests -q
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: wheels-sdist
           path: dist
 
+  # The unit tests of the release gate script (.github/scripts/release_checks.py), on every run,
+  # so a change to a gate is tested before a tag relies on it. The live tests read the real
+  # crates.io index.
+  release-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests of release_checks.py
+        env:
+          STARFIX_LIVE_NETWORK: '1'
+        run: python -m unittest discover -s .github/scripts -v
+
+  # The crate as crates.io receives it: packaged and built from the package alone, on every run.
+  # On a release tag also the crate's tests, so the crate is gated in this run (ci.yml runs them
+  # on the same tag too, but publishes nothing).
+  crate-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      # No --locked: Cargo.lock is not committed (a library), so there is none to hold to.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run
+      - name: cargo test
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: cargo test
+
   # The parity gate: the seeded differential harness against starfix-python 0.5.0 (PyPI,
   # hash-pinned), release tier: 100,000 seeds in 8 shards on each leg (newest pyarrow; Python
-  # 3.10 with pyarrow 19), python/tests/test_harness.py via differential-harness.yml. The publish
-  # jobs need it, so a release tag publishes only if it passes. It runs for release tags: pull
-  # requests run the 2,000-seed tier (ci.yml), and main runs this tier nightly.
+  # 3.10 with pyarrow 19), python/tests/test_harness.py via differential-harness.yml. Every
+  # publish job needs it, so a release tag publishes nothing unless it passes. It runs for
+  # release tags: pull requests run the 2,000-seed tier (ci.yml), and main runs this tier nightly.
   differential-harness:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/differential-harness.yml
@@ -150,24 +205,37 @@ jobs:
       seeds: 100000
       shards: '[0, 1, 2, 3, 4, 5, 6, 7]'
 
-  # The tag must name the version the wheels were built with (maturin takes it from Cargo.toml).
+  # The release gates that read the repository: the tag names Cargo.toml's version (maturin and
+  # cargo take the version from it), the tagged commit is on main, and CHANGELOG.md has the
+  # section "## <version>". A tag on any other commit publishes nothing.
   verify-tag:
+    needs: [release-checks]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - name: Cargo.toml version matches the tag
+        with:
+          fetch-depth: 0  # the history of main, for the ancestor check
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - name: The tag names Cargo.toml's version, is on main, and CHANGELOG.md has its section
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "ERROR: tag v${TAG} does not match Cargo.toml version ${CARGO_VERSION}"
-            exit 1
-          fi
+          # main as it is now, not as the checkout found it. The ref is named in full below: the
+          # checkout fetched the tags, and a tag named origin/main would shadow the short name.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          # The commit the tag points to (the checkout of the tag; an annotated tag peeled).
+          python .github/scripts/release_checks.py gates \
+            --tag "${GITHUB_REF_NAME}" --sha "$(git rev-parse 'HEAD^{commit}')" \
+            --main-ref refs/remotes/origin/main
 
+  # 1. TestPyPI, the rehearsal. uv publish --check-url compares each file with the index: a file
+  # already there with the same hash is skipped ("already exists, skipping"), a file there with
+  # other contents is an error, so a re-run uploads only what is missing.
   publish-testpypi:
     name: publish to TestPyPI
-    needs: [verify-tag, differential-harness, linux, macos, windows, sdist]
+    needs: [verify-tag, crate-package, differential-harness, linux, macos, windows, sdist]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -178,18 +246,83 @@ jobs:
       contents: read
       id-token: write  # trusted publishing (OIDC)
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
+      # Exactly the release's files, or nothing is uploaded: one wheel of this version for each
+      # target the build jobs above build, and the sdist (release_checks.py, RELEASE_WHEELS).
+      - name: dist holds every wheel and the sdist of this version, and nothing else
+        run: |
+          python .github/scripts/release_checks.py dist-complete \
+            --dir dist --version "${GITHUB_REF_NAME#v}"
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
-      - name: Publish to TestPyPI
-        run: uv publish --trusted-publishing always --publish-url https://test.pypi.org/legacy/ dist/*
+        with:
+          version: '0.13.7'  # --check-url and its skip behaviour were checked with this version
+      - name: Publish to TestPyPI (files already there are skipped)
+        run: |
+          uv publish --trusted-publishing always \
+            --publish-url https://test.pypi.org/legacy/ \
+            --check-url https://test.pypi.org/simple/ \
+            dist/*
 
+  # 2. crates.io. The sparse index lists every published version (yanked ones too); when it lists
+  # this one, the job says so and uploads nothing, so a re-run after a publication succeeds.
+  # Either way the job ends by waiting (at most 10 minutes) until the index lists the version,
+  # not yanked, so PyPI does not start before the crate is available to Cargo (a yanked version
+  # fails the job at once: Cargo does not select it, so PyPI is not published).
+  publish-crate:
+    name: publish to crates.io
+    needs: [verify-tag, crate-package, differential-harness, linux, macos, windows, sdist, publish-testpypi]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: crates
+      url: https://crates.io/crates/starfix
+    permissions:
+      contents: read
+      id-token: write  # crates.io trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - name: Is this version already on crates.io
+        id: crates-io
+        run: |
+          python .github/scripts/release_checks.py crate-published \
+            --name starfix --version "${GITHUB_REF_NAME#v}"
+      # Exchanges the job's OIDC token for a short-lived crates.io token
+      # (https://crates.io/docs/trusted-publishing); its post step revokes the token.
+      - name: Authenticate with crates.io (trusted publishing)
+        if: steps.crates-io.outputs.published == 'false'
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9  # v1.0.6
+      # No --locked: Cargo.lock is not committed (a library), so there is none to hold to.
+      - name: Publish to crates.io
+        if: steps.crates-io.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: cargo publish
+      - name: crates.io lists the version
+        run: |
+          python .github/scripts/release_checks.py wait-crate-listed \
+            --name starfix --version "${GITHUB_REF_NAME#v}" --timeout 600
+
+  # 3. PyPI, last. Re-runs skip files already there, as for TestPyPI.
   publish-pypi:
     name: publish to PyPI
-    needs: [publish-testpypi]
+    needs: [verify-tag, crate-package, differential-harness, linux, macos, windows, sdist, publish-testpypi, publish-crate]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -200,11 +333,28 @@ jobs:
       contents: read
       id-token: write  # trusted publishing (OIDC)
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
+      # Exactly the release's files, or nothing is uploaded: one wheel of this version for each
+      # target the build jobs above build, and the sdist (release_checks.py, RELEASE_WHEELS).
+      - name: dist holds every wheel and the sdist of this version, and nothing else
+        run: |
+          python .github/scripts/release_checks.py dist-complete \
+            --dir dist --version "${GITHUB_REF_NAME#v}"
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
-      - name: Publish to PyPI
-        run: uv publish --trusted-publishing always dist/*
+        with:
+          version: '0.13.7'  # --check-url and its skip behaviour were checked with this version
+      - name: Publish to PyPI (files already there are skipped)
+        run: |
+          uv publish --trusted-publishing always \
+            --check-url https://pypi.org/simple/ \
+            dist/*
