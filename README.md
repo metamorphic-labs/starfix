@@ -170,7 +170,7 @@ maturin develop
 
 Run this inside an activated Python virtual environment with a Rust toolchain available.
 
-**Release compatibility:** From 0.6.0, the PyPI `starfix` package is backed by the Rust implementation. `starfix` 0.5.0 on PyPI is the pure-Python implementation of hash format 2; 0.4.0 and earlier use hash format 1. See [Hash format and compatibility](#hash-format-and-compatibility) below.
+**Release compatibility:** From 0.6.0, the PyPI `starfix` package is backed by the Rust implementation. `starfix` 0.2.0 to 0.5.0 on PyPI are [starfix-python](https://github.com/metamorphic-labs/starfix-python), a separate pure-Python implementation: 0.5.0 implements hash format 2; 0.4.0 and earlier use hash format 1. See [Hash format and compatibility](#hash-format-and-compatibility) below.
 
 ---
 
