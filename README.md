@@ -529,4 +529,4 @@ For the normative hashing rules, see [Starfix Byte Layout Specification — Hash
 
 ## License
 
-Starfix is dual-licensed under MIT or Apache-2.0, at your option.
+Starfix is dual-licensed under [MIT](https://github.com/metamorphic-labs/starfix/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/metamorphic-labs/starfix/blob/main/LICENSE-APACHE), at your option.
