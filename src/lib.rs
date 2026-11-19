@@ -431,4 +431,10 @@ pub mod legacy;
 #[cfg(feature = "python")]
 mod python;
 
+/// The Rust samples of `README.md`, compiled and run as doctests by `cargo test` (the Python
+/// samples run in `python/tests/test_readme.py`). Only built by rustdoc for its tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 // Write a test to check that int32 digest is consistent

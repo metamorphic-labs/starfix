@@ -248,7 +248,17 @@ The prepared object is immutable and reusable. Starfix does not maintain a hidde
 The Rust API provides equivalent one-shot and streaming operations.
 
 ```rust
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use starfix::{ArrowDigester, HasherConfig};
+
+let batch = RecordBatch::try_from_iter([
+    ("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef),
+    ("score", Arc::new(Float64Array::from(vec![0.9, 0.7, 0.95])) as ArrayRef),
+])
+.expect("a valid record batch");
+let schema = batch.schema();
 
 // Hash a record batch.
 let hash = ArrowDigester::hash_record_batch(
@@ -262,10 +272,10 @@ let mut digester = ArrowDigester::new(
     HasherConfig::default(),
 );
 
-digester.update(&batch1);
-digester.update(&batch2);
+digester.update(&batch.slice(0, 1));
+digester.update(&batch.slice(1, 2));
 
-let hash = digester.finalize();
+assert_eq!(digester.finalize(), hash);
 
 // Hash a schema or individual array.
 let schema_hash = ArrowDigester::hash_schema(
@@ -273,13 +283,24 @@ let schema_hash = ArrowDigester::hash_schema(
     HasherConfig::default(),
 );
 
-let array_hash = ArrowDigester::hash_array(&array);
+let array_hash = ArrowDigester::hash_array(batch.column(1));
 ```
 
 For repeated hashing under a shared schema:
 
 ```rust
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use starfix::{ArrowDigester, HasherConfig};
+
+let batches: Vec<RecordBatch> = (0..3)
+    .map(|i| {
+        let ids = Arc::new(Int64Array::from(vec![i])) as ArrayRef;
+        RecordBatch::try_from_iter([("id", ids)]).expect("a valid record batch")
+    })
+    .collect();
+let schema = batches[0].schema();
 
 let prepared = ArrowDigester::prepare(
     &schema,
@@ -330,6 +351,8 @@ ordered_hash = ArrowDigester.hash_table(
 In Rust:
 
 ```rust
+use starfix::HasherConfig;
+
 let config = HasherConfig {
     ordered_columns: true,
     ordered_struct_fields: true,
