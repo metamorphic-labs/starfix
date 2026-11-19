@@ -123,7 +123,7 @@ Similarly, two tables containing the same rows in different orders are not consi
 
 Instead, Starfix implements a precise definition of logical identity based on Arrow's types, values, validity, and structure, together with a small number of configurable options.
 
-This definition is documented in the [byte-layout specification](docs/byte-layout-spec.md).
+This definition is documented in the [byte-layout specification](https://github.com/metamorphic-labs/starfix/blob/main/docs/byte-layout-spec.md).
 
 ---
 
@@ -131,7 +131,11 @@ This definition is documented in the [byte-layout specification](docs/byte-layou
 
 ### Rust
 
-Add the `starfix` crate to your Rust project.
+Add the `starfix` crate to your Rust project:
+
+```bash
+cargo add starfix
+```
 
 The current repository implements hash format 2, introduced in Starfix 0.5.0.
 
@@ -140,6 +144,16 @@ The current repository implements hash format 2, introduced in Starfix 0.5.0.
 Starfix provides a Python package backed by its Rust implementation, using PyO3 and the Arrow PyCapsule interface.
 
 The binding supports Python 3.10+ and PyArrow 14+.
+
+Install it with uv (preferred):
+
+```bash
+uv add starfix
+```
+
+Or with pip: `python -m pip install starfix`.
+
+Wheels are published for Linux (x86_64 and aarch64, glibc and musl), macOS (universal2), and Windows (x64). On other platforms, the source distribution builds with a Rust toolchain.
 
 To build the current repository's Python binding in a development environment:
 
@@ -150,7 +164,7 @@ maturin develop
 
 Run this inside an activated Python virtual environment with a Rust toolchain available.
 
-**Release compatibility:** The currently published PyPI `starfix` 0.4.0 package uses the older pure-Python implementation and hash format 1. The repository's 0.5.0 implementation uses hash format 2. See [Hash format and compatibility](#hash-format-and-compatibility) below.
+**Release compatibility:** From 0.6.0, the PyPI `starfix` package is backed by the Rust implementation. `starfix` 0.5.0 on PyPI is the pure-Python implementation of hash format 2; 0.4.0 and earlier use hash format 1. See [Hash format and compatibility](#hash-format-and-compatibility) below.
 
 ---
 
@@ -392,7 +406,7 @@ Schemas containing `Null`, `Map`, `Interval`, `Utf8View`, or `BinaryView` can be
 
 `ListView`, `LargeListView`, `Union`, and `RunEndEncoded` are rejected.
 
-For the precise type rules and unsupported cases, see the [byte-layout specification](docs/byte-layout-spec.md).
+For the precise type rules and unsupported cases, see the [byte-layout specification](https://github.com/metamorphic-labs/starfix/blob/main/docs/byte-layout-spec.md).
 
 ---
 
@@ -429,7 +443,7 @@ Starfix uses SHA-256 to compute the final digest from the canonical schema and d
 
 The hash format also distinguishes the type of hashing operation, so schema hashes, array hashes, and table/record-batch hashes belong to separate domains.
 
-The precise byte-level algorithm is specified in [docs/byte-layout-spec.md](docs/byte-layout-spec.md), enabling independent implementations to reproduce identical hashes.
+The precise byte-level algorithm is specified in [docs/byte-layout-spec.md](https://github.com/metamorphic-labs/starfix/blob/main/docs/byte-layout-spec.md), enabling independent implementations to reproduce identical hashes.
 
 ---
 
@@ -453,7 +467,7 @@ Hash format 2 is documented byte-for-byte and validated against a set of golden 
 
 ### Cross-language compatibility
 
-The Rust implementation and the corresponding format-2 `starfix-python` implementation produce identical hashes for the defined format.
+The Rust implementation and the corresponding format-2 `starfix-python` implementation produce identical hashes for the defined format, with one known exception: `starfix-python` 0.5.0 hashes a dictionary of sliced nested fixed-size lists incorrectly (a pyarrow `take()` defect).
 
 The Python binding in this repository uses the Rust hashing implementation and exposes a compatible Python interface.
 
@@ -482,7 +496,7 @@ The Python package also provides a legacy module at `starfix.legacy.v0_4`.
 
 These implementations exist to support previously stored hashes. New applications should use format 2.
 
-See the [changelog](CHANGELOG.md) and [byte-layout specification](docs/byte-layout-spec.md) for migration details.
+See the [changelog](https://github.com/metamorphic-labs/starfix/blob/main/CHANGELOG.md) and [byte-layout specification](https://github.com/metamorphic-labs/starfix/blob/main/docs/byte-layout-spec.md) for migration details.
 
 ---
 
@@ -511,7 +525,7 @@ The Python tests are available under `python/tests`.
 
 Golden vectors for hash format 2 are stored in `tests/golden/format2_v0.5.json`.
 
-For the normative hashing rules, see [Starfix Byte Layout Specification — Hash Format 2](docs/byte-layout-spec.md).
+For the normative hashing rules, see [Starfix Byte Layout Specification — Hash Format 2](https://github.com/metamorphic-labs/starfix/blob/main/docs/byte-layout-spec.md).
 
 ## License
 
