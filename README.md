@@ -139,6 +139,12 @@ cargo add starfix
 
 Starfix 0.5.0 and later implement hash format 2.
 
+Starfix 0.6.0 is built against arrow 57 (arrow-rs). The record batches, schemas, and arrays you pass to it must be arrow 57 types (another major version's types do not compile), so depend on the same major version:
+
+```bash
+cargo add arrow@57
+```
+
 ### Python
 
 Starfix provides a Python package backed by its Rust implementation, using PyO3 and the Arrow PyCapsule interface.
