@@ -186,6 +186,10 @@ table = pa.table({
 # Hash an entire table, regardless of chunking.
 table_hash = ArrowDigester.hash_table(table)
 
+# A hash is 35 bytes (a bytes object): the format, 00 00 02, then a SHA-256 digest.
+print(table_hash.hex())
+# 000002bca796d11ce3c4bc3d783f43a7bc22d4a471b4a55dffe1d4513843090c52fd0a
+
 # Hash a record batch.
 batch_hash = ArrowDigester.hash_record_batch(
     table.to_batches()[0]
@@ -253,9 +257,10 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use starfix::{ArrowDigester, HasherConfig};
 
-let batch = RecordBatch::try_from_iter([
-    ("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef),
-    ("score", Arc::new(Float64Array::from(vec![0.9, 0.7, 0.95])) as ArrayRef),
+// Nullable columns, like the pyarrow table above (nullability is part of the hash).
+let batch = RecordBatch::try_from_iter_with_nullable([
+    ("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef, true),
+    ("score", Arc::new(Float64Array::from(vec![0.9, 0.7, 0.95])) as ArrayRef, true),
 ])
 .expect("a valid record batch");
 let schema = batch.schema();
@@ -264,6 +269,13 @@ let schema = batch.schema();
 let hash = ArrowDigester::hash_record_batch(
     &batch,
     HasherConfig::default(),
+);
+
+// A hash is 35 bytes (a Vec<u8>): the format, 00 00 02, then a SHA-256 digest.
+// The same data hashes the same in Rust and in Python. (hex is the hex crate.)
+assert_eq!(
+    hex::encode(&hash),
+    "000002bca796d11ce3c4bc3d783f43a7bc22d4a471b4a55dffe1d4513843090c52fd0a",
 );
 
 // Hash multiple batches as one logical table.
