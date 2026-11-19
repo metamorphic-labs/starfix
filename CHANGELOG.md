@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- README: names the version or the package instead of "the current repository" (the README is
+  also the crates.io and PyPI page); shows a hash and what it is (35 bytes, `00 00 02` then a
+  SHA-256 digest); names the arrow version the crate builds against (57); says what
+  starfix-python is, what the Python functions accept (pyarrow objects only) and when
+  reordering rows or list elements changes a hash; states the stability promise of a hash
+  format.
+- The README samples run in CI: the Python blocks in `python/tests/test_readme.py` (their shown
+  output included), the Rust blocks as doctests (`cargo test`). The Rust blocks are complete
+  programs now.
+
 ## 0.6.0 (2026-11-19)
 
 ### Added — float options (ITL-1252)
