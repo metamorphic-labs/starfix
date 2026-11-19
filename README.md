@@ -210,6 +210,8 @@ array_hash = ArrowDigester.hash_array(
 )
 ```
 
+Every entry point takes pyarrow objects: `hash_table` a `pyarrow.Table`; `hash_record_batch` and `update` a `pyarrow.RecordBatch`; `hash_schema`, `ArrowDigester(...)`, and `prepare` a `pyarrow.Schema`; `hash_array` a `pyarrow.Array` or `pyarrow.ChunkedArray` (the `PreparedSchema` methods take what their namesakes take). Any other object, including a polars or pandas DataFrame, raises `TypeError`: convert it to pyarrow first, for example with `polars_df.to_arrow()` or `pa.Table.from_pandas(pandas_df)`.
+
 Table and record-batch hashing are based on the same logical table representation. The resulting digest is independent of how rows are divided among batches.
 
 ### Streaming record batches
