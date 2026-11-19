@@ -103,8 +103,8 @@ Starfix also preserves distinctions that are meaningful to the data.
 | Change a non-null value | Yes, subject to hash collisions |
 | Change a value's null status | Yes |
 | Change the number of rows | Yes |
-| Reorder rows | Generally yes |
-| Reorder list elements | Generally yes |
+| Reorder rows | Yes, unless the reordered rows are identical |
+| Reorder list elements | Yes, unless the reordered elements are identical |
 | Rename a column or struct field | Yes |
 | Change a field's logical type or nullability | Yes, unless the types are canonically equivalent |
 | Change schema or field metadata | Only with `include_metadata=True` |
