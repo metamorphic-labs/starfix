@@ -103,8 +103,8 @@ Starfix also preserves distinctions that are meaningful to the data.
 | Change a non-null value | Yes, subject to hash collisions |
 | Change a value's null status | Yes |
 | Change the number of rows | Yes |
-| Reorder rows | Generally yes |
-| Reorder list elements | Generally yes |
+| Reorder rows | Yes, unless the reordered rows are identical |
+| Reorder list elements | Yes, unless the reordered elements are identical |
 | Rename a column or struct field | Yes |
 | Change a field's logical type or nullability | Yes, unless the types are canonically equivalent |
 | Change schema or field metadata | Only with `include_metadata=True` |
@@ -137,7 +137,13 @@ Add the `starfix` crate to your Rust project:
 cargo add starfix
 ```
 
-The current repository implements hash format 2, introduced in Starfix 0.5.0.
+Starfix 0.5.0 and later implement hash format 2.
+
+Starfix 0.6.0 is built against arrow 57 (arrow-rs). The record batches, schemas, and arrays you pass to it must be arrow 57 types (another major version's types do not compile), so depend on the same major version:
+
+```bash
+cargo add arrow@57
+```
 
 ### Python
 
@@ -155,7 +161,7 @@ Or with pip: `python -m pip install starfix`.
 
 Wheels are published for Linux (x86_64 and aarch64, glibc and musl), macOS (universal2), and Windows (x64). On other platforms, the source distribution builds with a Rust toolchain.
 
-To build the current repository's Python binding in a development environment:
+To build the Python binding from source in a development environment:
 
 ```bash
 python -m pip install maturin "pyarrow>=14"
@@ -164,7 +170,7 @@ maturin develop
 
 Run this inside an activated Python virtual environment with a Rust toolchain available.
 
-**Release compatibility:** From 0.6.0, the PyPI `starfix` package is backed by the Rust implementation. `starfix` 0.5.0 on PyPI is the pure-Python implementation of hash format 2; 0.4.0 and earlier use hash format 1. See [Hash format and compatibility](#hash-format-and-compatibility) below.
+**Release compatibility:** From 0.6.0, the PyPI `starfix` package is backed by the Rust implementation. `starfix` 0.2.0 to 0.5.0 on PyPI are [starfix-python](https://github.com/metamorphic-labs/starfix-python), a separate pure-Python implementation: 0.5.0 implements hash format 2; 0.4.0 and earlier use hash format 1. See [Hash format and compatibility](#hash-format-and-compatibility) below.
 
 ---
 
@@ -186,6 +192,10 @@ table = pa.table({
 # Hash an entire table, regardless of chunking.
 table_hash = ArrowDigester.hash_table(table)
 
+# A hash is 35 bytes (a bytes object): the format, 00 00 02, then a SHA-256 digest.
+print(table_hash.hex())
+# 000002bca796d11ce3c4bc3d783f43a7bc22d4a471b4a55dffe1d4513843090c52fd0a
+
 # Hash a record batch.
 batch_hash = ArrowDigester.hash_record_batch(
     table.to_batches()[0]
@@ -199,6 +209,8 @@ array_hash = ArrowDigester.hash_array(
     table.column("score")
 )
 ```
+
+Every entry point takes pyarrow objects: `hash_table` a `pyarrow.Table`; `hash_record_batch` and `update` a `pyarrow.RecordBatch`; `hash_schema`, `ArrowDigester(...)`, and `prepare` a `pyarrow.Schema`; `hash_array` a `pyarrow.Array` or `pyarrow.ChunkedArray` (the `PreparedSchema` methods take what their namesakes take). Any other object, including a polars or pandas DataFrame, raises `TypeError`: convert it to pyarrow first, for example with `polars_df.to_arrow()` or `pa.Table.from_pandas(pandas_df)`.
 
 Table and record-batch hashing are based on the same logical table representation. The resulting digest is independent of how rows are divided among batches.
 
@@ -248,12 +260,30 @@ The prepared object is immutable and reusable. Starfix does not maintain a hidde
 The Rust API provides equivalent one-shot and streaming operations.
 
 ```rust
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use starfix::{ArrowDigester, HasherConfig};
+
+// Nullable columns, like the pyarrow table above (nullability is part of the hash).
+let batch = RecordBatch::try_from_iter_with_nullable([
+    ("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef, true),
+    ("score", Arc::new(Float64Array::from(vec![0.9, 0.7, 0.95])) as ArrayRef, true),
+])
+.expect("a valid record batch");
+let schema = batch.schema();
 
 // Hash a record batch.
 let hash = ArrowDigester::hash_record_batch(
     &batch,
     HasherConfig::default(),
+);
+
+// A hash is 35 bytes (a Vec<u8>): the format, 00 00 02, then a SHA-256 digest.
+// The same data hashes the same in Rust and in Python. (hex is the hex crate.)
+assert_eq!(
+    hex::encode(&hash),
+    "000002bca796d11ce3c4bc3d783f43a7bc22d4a471b4a55dffe1d4513843090c52fd0a",
 );
 
 // Hash multiple batches as one logical table.
@@ -262,10 +292,10 @@ let mut digester = ArrowDigester::new(
     HasherConfig::default(),
 );
 
-digester.update(&batch1);
-digester.update(&batch2);
+digester.update(&batch.slice(0, 1));
+digester.update(&batch.slice(1, 2));
 
-let hash = digester.finalize();
+assert_eq!(digester.finalize(), hash);
 
 // Hash a schema or individual array.
 let schema_hash = ArrowDigester::hash_schema(
@@ -273,13 +303,24 @@ let schema_hash = ArrowDigester::hash_schema(
     HasherConfig::default(),
 );
 
-let array_hash = ArrowDigester::hash_array(&array);
+let array_hash = ArrowDigester::hash_array(batch.column(1));
 ```
 
 For repeated hashing under a shared schema:
 
 ```rust
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use starfix::{ArrowDigester, HasherConfig};
+
+let batches: Vec<RecordBatch> = (0..3)
+    .map(|i| {
+        let ids = Arc::new(Int64Array::from(vec![i])) as ArrayRef;
+        RecordBatch::try_from_iter([("id", ids)]).expect("a valid record batch")
+    })
+    .collect();
+let schema = batches[0].schema();
 
 let prepared = ArrowDigester::prepare(
     &schema,
@@ -330,6 +371,8 @@ ordered_hash = ArrowDigester.hash_table(
 In Rust:
 
 ```rust
+use starfix::HasherConfig;
+
 let config = HasherConfig {
     ordered_columns: true,
     ordered_struct_fields: true,
@@ -455,7 +498,7 @@ Every Starfix hash consists of 35 bytes:
 [ 3-byte format version ][ 32-byte SHA-256 digest ]
 ```
 
-The current repository uses hash format 2:
+Starfix 0.5.0 and later use hash format 2:
 
 ```text
 00 00 02
@@ -465,11 +508,13 @@ The format version is independent of the library's package version.
 
 Hash format 2 is documented byte-for-byte and validated against a set of golden test vectors.
 
+A hash in a given format is stable: every release that implements hash format 2 produces the same format-2 hash for the same logical data and the same options, on any little-endian platform, in both the Rust crate and the Python package. A change that would alter an existing digest gets a new format number. The golden vectors and a differential test against starfix-python 0.5.0 check this on every pull request; the one recorded difference is the starfix-python 0.5.0 defect described below. The floating-point normalization options are the one setting not recorded in the hash: see the **Important** note under *Floating-point normalization*.
+
 ### Cross-language compatibility
 
 The Rust implementation and the corresponding format-2 `starfix-python` implementation produce identical hashes for the defined format, with one known exception: `starfix-python` 0.5.0 hashes a dictionary of sliced nested fixed-size lists incorrectly (a pyarrow `take()` defect).
 
-The Python binding in this repository uses the Rust hashing implementation and exposes a compatible Python interface.
+From 0.6.0, the `starfix` Python package uses the Rust hashing implementation and exposes a compatible Python interface.
 
 ### Legacy compatibility
 
@@ -513,7 +558,7 @@ Starfix includes tests for its logical-hashing invariants, including:
 - Hash-format conformance
 - Cross-implementation compatibility through golden vectors
 
-The repository includes exhaustive small-input testing across supported type families, along with targeted regression tests for historically problematic cases.
+The test suite includes exhaustive small-input testing across supported type families, along with targeted regression tests for historically problematic cases.
 
 Run the Rust test suite with:
 
