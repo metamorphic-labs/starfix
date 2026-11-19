@@ -84,9 +84,50 @@ def _leaf_types() -> list[pa.DataType]:
     ] + ([pa.decimal32(7, 2), pa.decimal64(15, 3)] if hasattr(pa, "decimal64") else [])  # fmt: skip
 
 
+# --- float mode (ITL-1252) ------------------------------------------------------------------
+# Off by default: the default mode draws exactly the values it always drew. In float mode every
+# float array is built from bit patterns drawn from `_FLOAT_BITS` (null slots included), then
+# normalized as the float options would hash them, so two cases of one seed, one raw and one
+# normalized, have the same structure and differ only in the values the options normalize.
+
+# (struct code, sign bit, exponent mask, fraction mask, canonical NaN) per float width.
+_FLOAT_LAYOUT = {
+    16: ("H", 0x8000, 0x7C00, 0x03FF, 0x7E00),
+    32: ("I", 0x8000_0000, 0x7F80_0000, 0x007F_FFFF, 0x7FC0_0000),
+    64: ("Q", 0x8000_0000_0000_0000, 0x7FF0_0000_0000_0000, 0x000F_FFFF_FFFF_FFFF, 0x7FF8_0000_0000_0000),
+}
+# +0.0, -0.0, 1.5, -2.25, +inf, -inf, NaN, -NaN, payload NaN, signaling NaN, negative signaling
+# NaN with a payload, smallest subnormal.
+_FLOAT_BITS = {
+    16: [0x0000, 0x8000, 0x3E00, 0xC080, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7E2A, 0x7C01, 0xFD55, 0x0001],
+    32: [
+        0x0000_0000, 0x8000_0000, 0x3FC0_0000, 0xC010_0000, 0x7F80_0000, 0xFF80_0000,
+        0x7FC0_0000, 0xFFC0_0000, 0x7FC0_002A, 0x7F80_0001, 0xFF95_5555, 0x0000_0001,
+    ],
+    64: [
+        0x0000_0000_0000_0000, 0x8000_0000_0000_0000, 0x3FF8_0000_0000_0000, 0xC002_0000_0000_0000,
+        0x7FF0_0000_0000_0000, 0xFFF0_0000_0000_0000, 0x7FF8_0000_0000_0000, 0xFFF8_0000_0000_0000,
+        0x7FF8_0000_0000_002A, 0x7FF0_0000_0000_0001, 0xFFF5_5555_5555_5555, 0x0000_0000_0000_0001,
+    ],
+}  # fmt: skip
+
+
+def normalized_float_bits(width: int, bits: int, negative_zero: bool, nan: bool) -> int:
+    """The bits the float options hash for `bits` (byte-layout spec Section 6): every NaN (an
+    all-ones exponent, a non-zero fraction) as the canonical NaN, -0.0 as +0.0."""
+    _, sign, exponent, fraction, canonical = _FLOAT_LAYOUT[width]
+    if nan and bits & exponent == exponent and bits & fraction:
+        return canonical
+    if negative_zero and bits == sign:
+        return 0
+    return bits
+
+
 class _Generator:
-    def __init__(self, rng: random.Random):
+    def __init__(self, rng: random.Random, floats: tuple[bool, bool] | None = None):
         self.rng = rng
+        # None: the default mode. Else float mode, normalized by (negative_zero, nan).
+        self.floats = floats
         self.tags: set[str] = set()
         # At most one defect (invalid data) per case: with two, the implementations may report
         # either one first, which is not a difference.
@@ -226,6 +267,8 @@ class _Generator:
             return pa.ExtensionArray.from_storage(t, self.array(t.storage_type, length, nullable, top))
         valid, null_count = self.validity(length, nullable, top)
         validity = pa.array(valid, pa.bool_()).buffers()[1] if null_count else None
+        if self.floats is not None and pa.types.is_floating(t):
+            return self.float_array(t, length, validity, null_count)
         if pa.types.is_float16(t):  # pyarrow < 26 builds float16 only from NumPy values
             data = struct.pack(f"<{length}e", *(self.value(t) if ok else 0.0 for ok in valid))
             return pa.Array.from_buffers(t, length, [validity, pa.py_buffer(data)], null_count)
@@ -254,6 +297,16 @@ class _Generator:
         if pa.types.is_null(t):
             return pa.nulls(length)
         return pa.array([self.value(t) if ok else None for ok in valid], t)
+
+    def float_array(self, t: pa.DataType, length: int, validity, null_count: int) -> pa.Array:
+        """Float mode: values drawn from `_FLOAT_BITS` for every slot (null ones too), then
+        normalized by `self.floats`."""
+        width = t.bit_width
+        code = _FLOAT_LAYOUT[width][0]
+        bits = [self.rng.choice(_FLOAT_BITS[width]) for _ in range(length)]
+        bits = [normalized_float_bits(width, b, *self.floats) for b in bits]
+        data = struct.pack(f"<{length}{code}", *bits)
+        return pa.Array.from_buffers(t, length, [validity, pa.py_buffer(data)], null_count)
 
     def dictionary_array(
         self, t: pa.DataType, length: int, valid: list[bool], nullable: bool | None, invalid_key: bool = False
@@ -364,9 +417,15 @@ def _bufferless_ok(t: pa.DataType) -> bool:
     return not nested and not pa.types.is_null(t)
 
 
-def build_case(seed: int) -> Case:
-    """The case of `seed` (deterministic for a seed, GENERATOR_VERSION and pyarrow version)."""
-    return _Generator(random.Random(f"starfix-harness-{GENERATOR_VERSION}-{seed}")).case(seed)
+def build_case(seed: int, floats: tuple[bool, bool] | None = None) -> Case:
+    """The case of `seed` (deterministic for a seed, GENERATOR_VERSION and pyarrow version).
+
+    `floats` selects float mode (ITL-1252): every float array holds special values (-0.0, NaNs
+    with a sign, a payload or the signaling bit), normalized by `floats` = (negative_zero, nan);
+    (False, False) is the raw case. All cases of one seed in float mode have the same structure.
+    The default (None) builds the differential harness's cases, unchanged."""
+    rng = random.Random(f"starfix-harness-{GENERATOR_VERSION}-{seed}")
+    return _Generator(rng, floats).case(seed)
 
 
 # --- expected differences (named, with the reason; listed in the pull request) ------------
@@ -578,7 +637,7 @@ def outcomes(digester_class, case: Case, option_sets: list[dict]) -> dict:
 
 
 def _calls(D, case: Case, table: pa.Table, options: dict) -> dict:
-    array_options = {k: options[k] for k in ("ordered_columns", "ordered_struct_fields")}
+    array_options = {k: v for k, v in options.items() if k != "include_metadata"}
 
     def stream():
         digester = D(case.schema, **options)

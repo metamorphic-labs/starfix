@@ -5,12 +5,13 @@
 use std::{
     collections::{BTreeMap, HashSet},
     iter::repeat_n,
+    ops::BitAnd,
     sync::Arc,
 };
 
 use arrow::{
     array::{
-        make_array, new_null_array, Array, ArrayRef, AsArray as _, BooleanArray,
+        make_array, new_null_array, Array, ArrayData, ArrayRef, AsArray as _, BooleanArray,
         FixedSizeListArray, GenericListArray, LargeBinaryArray, LargeListArray, LargeStringArray,
         ListArray, OffsetSizeTrait, RecordBatch, StructArray,
     },
@@ -43,6 +44,102 @@ const HEADER_MAGIC: &[u8; 8] = b"\x00starfix";
 const fn option_flags(config: HasherConfig) -> u8 {
     (config.ordered_columns as u8) | ((config.ordered_struct_fields as u8) << 1_u8)
 }
+
+/// The float options of `HasherConfig` (byte-layout spec Section 6): the float values that are
+/// hashed as another value. Unlike the order options they are not in the header.
+#[derive(Clone, Copy)]
+struct FloatNormalization {
+    /// `-0.0` is hashed as `+0.0`.
+    negative_zero: bool,
+    /// Every NaN is hashed as the quiet NaN with a clear sign and no payload.
+    nan: bool,
+}
+
+impl FloatNormalization {
+    const fn of(config: HasherConfig) -> Self {
+        Self {
+            negative_zero: config.normalize_negative_zero,
+            nan: config.normalize_nan,
+        }
+    }
+
+    /// Both options off: every float is hashed as is.
+    const fn is_off(self) -> bool {
+        !self.negative_zero && !self.nan
+    }
+
+    /// The bits hashed for a float whose bits are `bits`.
+    fn apply<T: FloatBits>(self, bits: T) -> T {
+        if self.nan && (bits & T::MAGNITUDE) > T::INFINITY {
+            T::CANONICAL_NAN
+        } else if self.negative_zero && bits == T::NEGATIVE_ZERO {
+            T::ZERO
+        } else {
+            bits
+        }
+    }
+
+    /// Whether the float whose bits are `bits` is hashed as another value.
+    fn changes<T: FloatBits>(self, bits: T) -> bool {
+        self.apply(bits) != bits
+    }
+}
+
+/// Size of the blocks in which normalized float bytes are fed to the digest: 16 KiB, a multiple
+/// of every float width.
+const FLOAT_BLOCK_BYTES: usize = 0x4000;
+
+/// The bit pattern of an IEEE 754 float (`u16` for `Float16`, `u32` for `Float32`, `u64` for
+/// `Float64`), read from and written as its little-endian bytes.
+trait FloatBits: Copy + Ord + BitAnd<Output = Self> {
+    /// Bytes per value.
+    const WIDTH: usize;
+    /// Every bit but the sign bit.
+    const MAGNITUDE: Self;
+    /// `+inf`: exponent all ones, fraction zero. A larger magnitude is a NaN.
+    const INFINITY: Self;
+    /// `-0.0`: the sign bit alone.
+    const NEGATIVE_ZERO: Self;
+    /// `+0.0`.
+    const ZERO: Self;
+    /// The quiet NaN with a clear sign and no payload.
+    const CANONICAL_NAN: Self;
+    /// The value of `WIDTH` little-endian bytes.
+    fn read(bytes: &[u8]) -> Self;
+    /// Append the value's little-endian bytes.
+    fn write(self, out: &mut Vec<u8>);
+}
+
+macro_rules! float_bits {
+    ($bits:ty, $width:literal, $magnitude:literal, $infinity:literal, $nan:literal) => {
+        impl FloatBits for $bits {
+            const WIDTH: usize = $width;
+            const MAGNITUDE: Self = $magnitude;
+            const INFINITY: Self = $infinity;
+            const NEGATIVE_ZERO: Self = !$magnitude;
+            const ZERO: Self = 0;
+            const CANONICAL_NAN: Self = $nan;
+
+            fn read(bytes: &[u8]) -> Self {
+                Self::from_le_bytes(bytes.try_into().expect("one value of the float's width"))
+            }
+
+            fn write(self, out: &mut Vec<u8>) {
+                out.extend_from_slice(&self.to_le_bytes());
+            }
+        }
+    };
+}
+
+float_bits!(u16, 2, 0x7fff, 0x7c00, 0x7e00);
+float_bits!(u32, 4, 0x7fff_ffff, 0x7f80_0000, 0x7fc0_0000);
+float_bits!(
+    u64,
+    8,
+    0x7fff_ffff_ffff_ffff,
+    0x7ff0_0000_0000_0000,
+    0x7ff8_0000_0000_0000
+);
 
 /// `0x00 "starfix" || format version (3 bytes) || entry-point kind || flags` — the first input
 /// of every digest, in every mode (13 bytes).
@@ -450,8 +547,9 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             .row_count
             .checked_add(record_batch.num_rows() as u64)
             .ok_or(StarfixError::RowCountOverflow)?;
+        let norm = FloatNormalization::of(self.analysis.config);
         let mut guard = RestoreUnlessKept::new(&mut self.fields_digest_buffer);
-        Self::ingest_into(record_batch, guard.entries())?;
+        Self::ingest_into(record_batch, norm, guard.entries())?;
         guard.keep();
         self.row_count = row_count;
         Ok(())
@@ -467,7 +565,8 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             .row_count
             .checked_add(record_batch.num_rows() as u64)
             .ok_or(StarfixError::RowCountOverflow)?;
-        Self::ingest_into(record_batch, &mut self.fields_digest_buffer)?;
+        let norm = FloatNormalization::of(self.analysis.config);
+        Self::ingest_into(record_batch, norm, &mut self.fields_digest_buffer)?;
         self.row_count = row_count;
         Ok(())
     }
@@ -475,6 +574,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
     /// Traverse every column of a batch into the entries.
     fn ingest_into(
         record_batch: &RecordBatch,
+        norm: FloatNormalization,
         entries: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         let schema = record_batch.schema_ref();
@@ -489,6 +589,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 array.as_ref(),
                 &path,
                 None, // no ancestor struct nulls at top level
+                norm,
                 entries,
             )?;
         }
@@ -547,6 +648,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         config: HasherConfig,
     ) -> Result<Vec<u8>, StarfixError> {
         let flags = option_flags(config);
+        let norm = FloatNormalization::of(config);
         if let Some(chunk) = chunks.iter().find(|chunk| chunk.data_type() != data_type) {
             return Err(StarfixError::ChunkTypeMismatch(chunk.data_type().clone()));
         }
@@ -582,7 +684,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
 
         // Traverse and populate entries, chunk after chunk
         for chunk in chunks {
-            Self::traverse_and_update(data_type, true, *chunk, "", None, &mut fields)?;
+            Self::traverse_and_update(data_type, true, *chunk, "", None, norm, &mut fields)?;
         }
 
         // Finalize all entries into the digest (same order as record-batch finalize)
@@ -1000,6 +1102,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         array: &dyn Array,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         // Normalize small variants
@@ -1026,6 +1129,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                         nullable,
                         path,
                         ancestor_struct_nulls,
+                        norm,
                         fields,
                     );
                 }
@@ -1046,6 +1150,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                     decoded.as_ref(),
                     path,
                     ancestor_struct_nulls,
+                    norm,
                     fields,
                 );
             }
@@ -1061,6 +1166,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 nullable,
                 path,
                 ancestor_struct_nulls,
+                norm,
                 fields,
             ),
             DataType::FixedSizeList(value_field, _) => Self::traverse_fixed_size_list(
@@ -1069,6 +1175,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 nullable,
                 path,
                 ancestor_struct_nulls,
+                norm,
                 fields,
             ),
             DataType::Struct(_) => Self::traverse_struct(
@@ -1076,6 +1183,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 nullable,
                 path,
                 ancestor_struct_nulls,
+                norm,
                 fields,
             ),
             _ => Self::traverse_leaf(
@@ -1084,6 +1192,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 nullable,
                 path,
                 ancestor_struct_nulls,
+                norm,
                 fields,
             ),
         }
@@ -1101,6 +1210,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         let dictionary = array.as_any_dictionary();
@@ -1135,6 +1245,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 value.as_ref(),
                 path,
                 ancestor.as_ref(),
+                norm,
                 fields,
             )?;
         }
@@ -1169,6 +1280,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
@@ -1178,6 +1290,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 nullable,
                 path,
                 ancestor_struct_nulls,
+                norm,
                 fields,
             )
         } else {
@@ -1191,6 +1304,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 nullable,
                 path,
                 ancestor_struct_nulls,
+                norm,
                 fields,
             )
         }
@@ -1202,6 +1316,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError>
     where
@@ -1261,6 +1376,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 items.as_ref(),
                 &element_path,
                 None, // list elements don't have ancestor struct nulls
+                norm,
                 fields,
             )?;
         }
@@ -1281,6 +1397,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         let list_array = array
@@ -1332,6 +1449,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 items.as_ref(),
                 &element_path,
                 None, // a fixed-size list starts a new list level: no ancestor struct nulls
+                norm,
                 fields,
             )?;
         }
@@ -1390,6 +1508,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         let struct_array = array
@@ -1438,6 +1557,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                 child_array.as_ref(),
                 &child_path,
                 combined_nulls.as_ref(),
+                norm,
                 fields,
             )?;
         }
@@ -1450,6 +1570,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         nullable: bool,
         path: &str,
         ancestor_struct_nulls: Option<&NullBuffer>,
+        norm: FloatNormalization,
         fields: &mut BTreeMap<String, DigestBufferType<D>>,
     ) -> Result<(), StarfixError> {
         Self::check_nulls_allowed(nullable, array.nulls(), ancestor_struct_nulls, path)?;
@@ -1462,7 +1583,13 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         if let Some(ref mut null_bits) = entry.null_bits {
             Self::push_validity(null_bits, effective_nulls.as_ref(), array.len());
         }
-        Self::hash_leaf_values(data_type, array, effective_nulls.as_ref(), entry.data_mut());
+        Self::hash_leaf_values(
+            data_type,
+            array,
+            effective_nulls.as_ref(),
+            norm,
+            entry.data_mut(),
+        );
         Ok(())
     }
 
@@ -1480,7 +1607,8 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
 
     /// Feed the values of the valid elements of a leaf array into `data` (byte-layout spec
     /// Section 3.2). `validity` is the effective validity (own AND enclosing structs); the array's
-    /// own null buffer is not consulted, so no array is rebuilt.
+    /// own null buffer is not consulted, so no array is rebuilt. Float values are fed as `norm`
+    /// normalizes them (Section 6); the array is never modified.
     #[expect(
         clippy::unreachable,
         reason = "Unsupported data types are rejected before any data is hashed"
@@ -1489,6 +1617,7 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
         data_type: &DataType,
         array: &dyn Array,
         validity: Option<&NullBuffer>,
+        norm: FloatNormalization,
         data: &mut D,
     ) {
         let valid = |i: usize| validity.is_none_or(|nb| nb.is_valid(i));
@@ -1503,6 +1632,16 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                     .map(|i| u8::from(bools.value(i)))
                     .collect();
                 data.update(&bytes);
+            }
+            // With both float options off (the default) floats are fixed-size values like any other
+            DataType::Float16 if !norm.is_off() => {
+                Self::hash_floats::<u16>(array, validity, norm, data);
+            }
+            DataType::Float32 if !norm.is_off() => {
+                Self::hash_floats::<u32>(array, validity, norm, data);
+            }
+            DataType::Float64 if !norm.is_off() => {
+                Self::hash_floats::<u64>(array, validity, norm, data);
             }
             DataType::Int8 | DataType::UInt8 => Self::hash_fixed_size(array, validity, 1, data),
             DataType::Int16 | DataType::UInt16 | DataType::Float16 => {
@@ -1568,6 +1707,36 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
             return; // zero-width values (FixedSizeBinary(0)) contribute no bytes
         }
         let array_data = array.to_data();
+        Self::feed_fixed_size(
+            Self::value_slice(&array_data, element_size),
+            validity,
+            element_size,
+            data,
+        );
+    }
+
+    /// Feed fixed-size values of `element_size` bytes from `slice`: all of it when every element
+    /// is valid, else the bytes of each valid element.
+    fn feed_fixed_size(
+        slice: &[u8],
+        validity: Option<&NullBuffer>,
+        element_size: usize,
+        data: &mut D,
+    ) {
+        match validity.filter(|nb| nb.null_count() > 0) {
+            None => data.update(slice),
+            Some(nb) => {
+                for (i, value) in slice.chunks_exact(element_size).enumerate() {
+                    if nb.is_valid(i) {
+                        data.update(value);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The value bytes of the `len` elements of a fixed-size array, after its offset.
+    fn value_slice(array_data: &ArrayData, element_size: usize) -> &[u8] {
         let start = array_data
             .offset()
             .checked_mul(element_size)
@@ -1580,23 +1749,48 @@ impl<D: Digest + Clone> ArrowDigesterCore<D> {
                     .expect("Length multiplication overflow"),
             )
             .expect("End position overflow");
-        let slice = array_data
+        array_data
             .buffers()
             .first()
             .expect("fixed-size array has a value buffer")
             .as_slice()
             .get(start..end)
-            .expect("value buffer covers the array");
-        match validity.filter(|nb| nb.null_count() > 0) {
-            None => data.update(slice),
-            Some(nb) => {
-                for (i, value) in slice.chunks_exact(element_size).enumerate() {
-                    if nb.is_valid(i) {
-                        data.update(value);
-                    }
+            .expect("value buffer covers the array")
+    }
+
+    /// Float values with a float option on (byte-layout spec Section 6): the bytes of every
+    /// valid value after `norm`, exactly as `hash_fixed_size` feeds the normalized values. The
+    /// value buffer is scanned once; when no value changes it is fed as `hash_fixed_size` feeds
+    /// it, otherwise the normalized bytes are fed in blocks. The array is never modified.
+    fn hash_floats<T: FloatBits>(
+        array: &dyn Array,
+        validity: Option<&NullBuffer>,
+        norm: FloatNormalization,
+        data: &mut D,
+    ) {
+        let array_data = array.to_data();
+        let slice = Self::value_slice(&array_data, T::WIDTH);
+        // Null slots are scanned too (one pass without branches); a change found only there
+        // takes the slower path, which still feeds valid values only.
+        let changes = slice
+            .chunks_exact(T::WIDTH)
+            .fold(false, |found, value| found | norm.changes(T::read(value)));
+        if !changes {
+            Self::feed_fixed_size(slice, validity, T::WIDTH, data);
+            return;
+        }
+        let valid = validity.filter(|nb| nb.null_count() > 0);
+        let mut block = Vec::with_capacity(FLOAT_BLOCK_BYTES);
+        for (i, value) in slice.chunks_exact(T::WIDTH).enumerate() {
+            if valid.is_none_or(|nb| nb.is_valid(i)) {
+                norm.apply(T::read(value)).write(&mut block);
+                if block.len() >= FLOAT_BLOCK_BYTES {
+                    data.update(&block);
+                    block.clear();
                 }
             }
         }
+        data.update(&block);
     }
 
     /// Create the entries of a column (the node at its bare name) and of every node below it;

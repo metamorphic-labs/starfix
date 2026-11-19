@@ -134,6 +134,7 @@ mod tests {
                     include_metadata: true,
                     ordered_columns: flags & 1 != 0,
                     ordered_struct_fields: flags & 2 != 0,
+                    ..HasherConfig::default()
                 };
                 assert!(
                     !panics(|| {

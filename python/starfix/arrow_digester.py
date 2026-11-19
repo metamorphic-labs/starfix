@@ -171,6 +171,13 @@ class ArrowDigester:
     reordered. Arrow schema- and field-level metadata are hashed only with
     ``include_metadata=True``; a schema without metadata hashes the same either way.
 
+    Float values are hashed by their bits as they are, unless ``normalize_negative_zero``
+    (-0.0 hashed as +0.0) or ``normalize_nan`` (every NaN hashed as the quiet NaN with a clear
+    sign and no payload) is set. Unlike the order options these two are not recorded in the
+    hash: with one on, data hashes exactly as the same data with its float values normalized
+    hashes with it off. Do not mix hashes taken with different float options where bit-exact
+    identity matters.
+
     Raises ``ValueError`` (in every mode) for: schemas in which two nodes share a path
     (duplicate names, or a name containing ``/`` that aliases another node); ListView,
     LargeListView, Union and RunEndEncoded types; hashing data of a schema containing
@@ -198,6 +205,8 @@ class ArrowDigester:
         include_metadata: bool = False,
         ordered_columns: bool = False,
         ordered_struct_fields: bool = False,
+        normalize_negative_zero: bool = False,
+        normalize_nan: bool = False,
     ) -> None:
         """Start a streaming hash of record batches with this schema.
 
@@ -207,6 +216,10 @@ class ArrowDigester:
             ordered_columns: Make the order of the top-level columns part of the hash.
             ordered_struct_fields: Make the order of struct fields, at every depth,
                 part of the hash.
+            normalize_negative_zero: Hash every -0.0 float value (float16, float32,
+                float64, at every depth) as +0.0. Not recorded in the hash.
+            normalize_nan: Hash every NaN float value (any sign or payload) as the
+                quiet NaN with a clear sign and no payload. Not recorded in the hash.
 
         Hashes taken with different order options never coincide.
         """
@@ -215,9 +228,7 @@ class ArrowDigester:
         has_nul = _has_nul_name(schema)
         self._digester = _internal.Digester(
             schema,
-            bool(include_metadata),
-            bool(ordered_columns),
-            bool(ordered_struct_fields),
+            _options(include_metadata, ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan),
             schema if has_nul else None,
         )
         self._schema = schema
@@ -238,6 +249,8 @@ class ArrowDigester:
         include_metadata: bool = False,
         ordered_columns: bool = False,
         ordered_struct_fields: bool = False,
+        normalize_negative_zero: bool = False,
+        normalize_nan: bool = False,
     ) -> PreparedSchema:
         """Analyse a schema once, for hashing many tables or record batches of it.
 
@@ -252,12 +265,16 @@ class ArrowDigester:
             ordered_columns: Make the order of the top-level columns part of the hash.
             ordered_struct_fields: Make the order of struct fields, at every depth,
                 part of the hash.
+            normalize_negative_zero: Hash every -0.0 float value (float16, float32,
+                float64, at every depth) as +0.0. Not recorded in the hash.
+            normalize_nan: Hash every NaN float value (any sign or payload) as the
+                quiet NaN with a clear sign and no payload. Not recorded in the hash.
         """
         _require_little_endian()
         _require(schema, pa.Schema, "prepare", "a pyarrow.Schema")
-        options = (bool(include_metadata), bool(ordered_columns), bool(ordered_struct_fields))
+        options = _options(include_metadata, ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan)
         has_nul = _has_nul_name(schema)
-        prepared = _internal.Prepared(schema, *options, schema if has_nul else None)
+        prepared = _internal.Prepared(schema, options, schema if has_nul else None)
         return PreparedSchema._create(schema, prepared, options, has_nul)
 
     def update(self, record_batch: pa.RecordBatch) -> None:
@@ -277,15 +294,16 @@ class ArrowDigester:
         include_metadata: bool = False,
         ordered_columns: bool = False,
         ordered_struct_fields: bool = False,
+        normalize_negative_zero: bool = False,
+        normalize_nan: bool = False,
     ) -> bytes:
-        """Hash an Arrow schema."""
+        """Hash an Arrow schema. The float options have no effect on a schema's hash; they are
+        accepted as by every entry point."""
         _require_little_endian()
         _require(schema, pa.Schema, "hash_schema", "a pyarrow.Schema")
         return _internal.hash_schema(
             schema,
-            bool(include_metadata),
-            bool(ordered_columns),
-            bool(ordered_struct_fields),
+            _options(include_metadata, ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan),
             schema if _has_nul_name(schema) else None,
         )
 
@@ -296,6 +314,8 @@ class ArrowDigester:
         include_metadata: bool = False,
         ordered_columns: bool = False,
         ordered_struct_fields: bool = False,
+        normalize_negative_zero: bool = False,
+        normalize_nan: bool = False,
     ) -> bytes:
         """Hash one record batch (equal to streaming it through a digester)."""
         _require(record_batch, pa.RecordBatch, "hash_record_batch", _BATCH_TYPE)
@@ -303,9 +323,7 @@ class ArrowDigester:
         batch = _batch(record_batch)
         return _internal.hash_record_batch(
             batch,
-            bool(include_metadata),
-            bool(ordered_columns),
-            bool(ordered_struct_fields),
+            _options(include_metadata, ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan),
             batch.schema if _has_nul_name(batch.schema) else None,
         )
 
@@ -316,6 +334,8 @@ class ArrowDigester:
         include_metadata: bool = False,
         ordered_columns: bool = False,
         ordered_struct_fields: bool = False,
+        normalize_negative_zero: bool = False,
+        normalize_nan: bool = False,
     ) -> bytes:
         """Hash a table: a digester over ``table.to_batches()``."""
         _require(table, pa.Table, "hash_table", _TABLE_TYPE)
@@ -323,9 +343,7 @@ class ArrowDigester:
         return _internal.hash_table(
             table.schema,
             _batches_of(table),
-            bool(include_metadata),
-            bool(ordered_columns),
-            bool(ordered_struct_fields),
+            _options(include_metadata, ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan),
             table.schema if _has_nul_name(table.schema) else None,
         )
 
@@ -335,11 +353,15 @@ class ArrowDigester:
         *,
         ordered_columns: bool = False,
         ordered_struct_fields: bool = False,
+        normalize_negative_zero: bool = False,
+        normalize_nan: bool = False,
     ) -> bytes:
         """Hash a single array or ChunkedArray (equal to its chunks combined).
 
         There is deliberately no ``include_metadata``: an array has no schema or field
         metadata. ``ordered_columns`` changes only the header of an array's hash.
+        ``normalize_negative_zero`` and ``normalize_nan`` apply to the array's float values at
+        every depth, as for a table.
         """
         _require_little_endian()
         _require(array, (pa.Array, pa.ChunkedArray), "hash_array", "a pyarrow.Array or pyarrow.ChunkedArray")
@@ -348,8 +370,7 @@ class ArrowDigester:
         return _internal.hash_array(
             t,
             [_array(chunk) for chunk in chunks],
-            bool(ordered_columns),
-            bool(ordered_struct_fields),
+            _options(False, ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan),
             t if _type_has_nul_name(t) else None,
         )
 
@@ -408,7 +429,9 @@ class PreparedSchema:
     def __repr__(self) -> str:
         return (
             f"PreparedSchema(include_metadata={self.include_metadata}, ordered_columns={self.ordered_columns}, "
-            f"ordered_struct_fields={self.ordered_struct_fields}, schema_digest={self.schema_digest.hex()})"
+            f"ordered_struct_fields={self.ordered_struct_fields}, "
+            f"normalize_negative_zero={self.normalize_negative_zero}, normalize_nan={self.normalize_nan}, "
+            f"schema_digest={self.schema_digest.hex()})"
         )
 
     @property
@@ -427,6 +450,14 @@ class PreparedSchema:
     @property
     def ordered_struct_fields(self) -> bool:
         return self._options[2]
+
+    @property
+    def normalize_negative_zero(self) -> bool:
+        return self._options[3]
+
+    @property
+    def normalize_nan(self) -> bool:
+        return self._options[4]
 
     @property
     def schema_digest(self) -> bytes:
@@ -450,10 +481,36 @@ class PreparedSchema:
         return ArrowDigester._from_internal(self._prepared.digester(), self._schema, self._has_nul)
 
 
-def _prepare(schema: pa.Schema, include_metadata: bool, ordered_columns: bool, ordered_struct_fields: bool) -> PreparedSchema:
+def _options(
+    include_metadata: object,
+    ordered_columns: object,
+    ordered_struct_fields: object,
+    normalize_negative_zero: object,
+    normalize_nan: object,
+) -> tuple[bool, bool, bool, bool, bool]:
+    """The options of a call as the extension module takes them."""
+    return (
+        bool(include_metadata),
+        bool(ordered_columns),
+        bool(ordered_struct_fields),
+        bool(normalize_negative_zero),
+        bool(normalize_nan),
+    )
+
+
+def _prepare(
+    schema: pa.Schema,
+    include_metadata: bool,
+    ordered_columns: bool,
+    ordered_struct_fields: bool,
+    normalize_negative_zero: bool = False,
+    normalize_nan: bool = False,
+) -> PreparedSchema:
     return ArrowDigester.prepare(
         schema,
         include_metadata=include_metadata,
         ordered_columns=ordered_columns,
         ordered_struct_fields=ordered_struct_fields,
+        normalize_negative_zero=normalize_negative_zero,
+        normalize_nan=normalize_nan,
     )

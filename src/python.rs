@@ -37,15 +37,24 @@ use pyo3::types::{PyBytes, PyCapsule, PyTuple};
 
 use crate::{ArrowDigester, HasherConfig, PreparedSchema, StarfixError};
 
-const fn config(
-    include_metadata: bool,
-    ordered_columns: bool,
-    ordered_struct_fields: bool,
-) -> HasherConfig {
+/// The options of a call, as the Python wrapper passes them: `(include_metadata,
+/// ordered_columns, ordered_struct_fields, normalize_negative_zero, normalize_nan)`.
+type Options = (bool, bool, bool, bool, bool);
+
+const fn config(options: Options) -> HasherConfig {
+    let (
+        include_metadata,
+        ordered_columns,
+        ordered_struct_fields,
+        normalize_negative_zero,
+        normalize_nan,
+    ) = options;
     HasherConfig {
         include_metadata,
         ordered_columns,
         ordered_struct_fields,
+        normalize_negative_zero,
+        normalize_nan,
     }
 }
 
@@ -997,37 +1006,34 @@ fn extension_metadata<'py>(
     ))
 }
 
-/// `ArrowDigester.hash_schema`. Each entry point takes `full_names`: the `pyarrow.Schema` (or
-/// type) to take field names from when one contains NUL, else `None` (see [`with_full_names`]).
+/// `ArrowDigester.hash_schema`. Each entry point takes the call's [`Options`] and `full_names`:
+/// the `pyarrow.Schema` (or type) to take field names from when one contains NUL, else `None`
+/// (see [`with_full_names`]).
 #[pyfunction]
-#[pyo3(signature = (py_schema, include_metadata, ordered_columns, ordered_struct_fields, full_names))]
+#[pyo3(signature = (py_schema, options, full_names))]
 fn hash_schema<'py>(
     py: Python<'py>,
     py_schema: &Bound<'py, PyAny>,
-    include_metadata: bool,
-    ordered_columns: bool,
-    ordered_struct_fields: bool,
+    options: Options,
     full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let schema = import_schema(py_schema, include_metadata, full_names)?;
-    let config = config(include_metadata, ordered_columns, ordered_struct_fields);
+    let config = config(options);
+    let schema = import_schema(py_schema, config.include_metadata, full_names)?;
     let digest = hashing(py, || ArrowDigester::try_hash_schema(&schema, config))?;
     Ok(bytes(py, &digest))
 }
 
 /// `ArrowDigester.hash_record_batch`.
 #[pyfunction]
-#[pyo3(signature = (py_batch, include_metadata, ordered_columns, ordered_struct_fields, full_names))]
+#[pyo3(signature = (py_batch, options, full_names))]
 fn hash_record_batch<'py>(
     py: Python<'py>,
     py_batch: &Bound<'py, PyAny>,
-    include_metadata: bool,
-    ordered_columns: bool,
-    ordered_struct_fields: bool,
+    options: Options,
     full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let batch = import_record_batch(py_batch, include_metadata, full_names)?;
-    let config = config(include_metadata, ordered_columns, ordered_struct_fields);
+    let config = config(options);
+    let batch = import_record_batch(py_batch, config.include_metadata, full_names)?;
     let digest = hashing(py, || ArrowDigester::try_hash_record_batch(&batch, config))?;
     Ok(bytes(py, &digest))
 }
@@ -1035,26 +1041,15 @@ fn hash_record_batch<'py>(
 /// `ArrowDigester.hash_table`: a digester over `batches`, the table's record batches (a table
 /// without any hashes as a digester without updates, equal to one empty batch).
 #[pyfunction]
-#[pyo3(signature = (
-    py_schema, batches, include_metadata, ordered_columns, ordered_struct_fields, full_names
-))]
+#[pyo3(signature = (py_schema, batches, options, full_names))]
 fn hash_table<'py>(
     py: Python<'py>,
     py_schema: &Bound<'py, PyAny>,
     batches: &Bound<'py, PyAny>,
-    include_metadata: bool,
-    ordered_columns: bool,
-    ordered_struct_fields: bool,
+    options: Options,
     full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let mut digester = Digester::new(
-        py,
-        py_schema,
-        include_metadata,
-        ordered_columns,
-        ordered_struct_fields,
-        full_names,
-    )?;
+    let mut digester = Digester::new(py, py_schema, options, full_names)?;
     for py_batch in batches.try_iter()? {
         digester.update(py, &py_batch?, full_names)?;
     }
@@ -1062,15 +1057,15 @@ fn hash_table<'py>(
 }
 
 /// `ArrowDigester.hash_array`: the chunks of a `ChunkedArray` (or one array), all of type
-/// `py_type`, hashed as their concatenation without concatenating them.
+/// `py_type`, hashed as their concatenation without concatenating them (`include_metadata` of
+/// `options` has no effect).
 #[pyfunction]
-#[pyo3(signature = (py_type, py_chunks, ordered_columns, ordered_struct_fields, full_names))]
+#[pyo3(signature = (py_type, py_chunks, options, full_names))]
 fn hash_array<'py>(
     py: Python<'py>,
     py_type: &Bound<'py, PyAny>,
     py_chunks: &Bound<'py, PyAny>,
-    ordered_columns: bool,
-    ordered_struct_fields: bool,
+    options: Options,
     full_names: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let exported_type = import_type(py_type)?;
@@ -1082,7 +1077,7 @@ fn hash_array<'py>(
         .try_iter()?
         .map(|chunk| import_array(&chunk?, full_names))
         .collect::<PyResult<Vec<_>>>()?;
-    let config = config(false, ordered_columns, ordered_struct_fields);
+    let config = config(options);
     let digest = hashing(py, || {
         let chunk_refs: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
         ArrowDigester::try_hash_array_chunks(&data_type, &chunk_refs, config)
@@ -1100,22 +1095,18 @@ struct Digester {
 #[pymethods]
 impl Digester {
     #[new]
-    #[pyo3(signature = (
-        py_schema, include_metadata, ordered_columns, ordered_struct_fields, full_names
-    ))]
+    #[pyo3(signature = (py_schema, options, full_names))]
     fn new(
         py: Python<'_>,
         py_schema: &Bound<'_, PyAny>,
-        include_metadata: bool,
-        ordered_columns: bool,
-        ordered_struct_fields: bool,
+        options: Options,
         full_names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let schema = import_schema(py_schema, include_metadata, full_names)?;
-        let config = config(include_metadata, ordered_columns, ordered_struct_fields);
+        let config = config(options);
+        let schema = import_schema(py_schema, config.include_metadata, full_names)?;
         Ok(Self {
             digester: hashing(py, || ArrowDigester::try_new(&schema, config))?,
-            include_metadata,
+            include_metadata: config.include_metadata,
         })
     }
 
@@ -1149,19 +1140,15 @@ struct Prepared {
 #[pymethods]
 impl Prepared {
     #[new]
-    #[pyo3(signature = (
-        py_schema, include_metadata, ordered_columns, ordered_struct_fields, full_names
-    ))]
+    #[pyo3(signature = (py_schema, options, full_names))]
     fn new(
         py: Python<'_>,
         py_schema: &Bound<'_, PyAny>,
-        include_metadata: bool,
-        ordered_columns: bool,
-        ordered_struct_fields: bool,
+        options: Options,
         full_names: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let schema = import_schema(py_schema, include_metadata, full_names)?;
-        let config = config(include_metadata, ordered_columns, ordered_struct_fields);
+        let config = config(options);
+        let schema = import_schema(py_schema, config.include_metadata, full_names)?;
         Ok(Self {
             prepared: hashing(py, || PreparedSchema::try_new(&schema, config))?,
         })

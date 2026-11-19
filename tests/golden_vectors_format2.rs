@@ -34,6 +34,7 @@ mod tests {
     }
 
     #[derive(Deserialize)]
+    #[expect(clippy::struct_excessive_bools, reason = "One field per option")]
     struct GoldenVector {
         id: String,
         description: String,
@@ -41,6 +42,11 @@ mod tests {
         include_metadata: bool,
         ordered_columns: bool,
         ordered_struct_fields: bool,
+        /// The float options: absent (false) in every vector that does not set them.
+        #[serde(default)]
+        normalize_negative_zero: bool,
+        #[serde(default)]
+        normalize_nan: bool,
         ipc_b64: String,
         expected_hash: String,
     }
@@ -96,6 +102,8 @@ mod tests {
             include_metadata: v.include_metadata,
             ordered_columns: v.ordered_columns,
             ordered_struct_fields: v.ordered_struct_fields,
+            normalize_negative_zero: v.normalize_negative_zero,
+            normalize_nan: v.normalize_nan,
         };
         let (schema, batches) = decode_ipc(v);
         let one_batch = || {
@@ -182,6 +190,8 @@ mod tests {
                 && !v.include_metadata
                 && !v.ordered_columns
                 && !v.ordered_struct_fields
+                && !v.normalize_negative_zero
+                && !v.normalize_nan
         }) {
             let (_, batches) = decode_ipc(v);
             let b = batches.first().expect("one batch");

@@ -35,6 +35,7 @@ mod tests {
             include_metadata: false,
             ordered_columns: flags & 0x01 != 0,
             ordered_struct_fields: flags & 0x02 != 0,
+            ..HasherConfig::default()
         }
     }
 

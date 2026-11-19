@@ -44,6 +44,8 @@ mod tests {
         include_metadata: false,
         ordered_columns: true,
         ordered_struct_fields: true,
+        normalize_negative_zero: false,
+        normalize_nan: false,
     };
 
     #[derive(Default)]

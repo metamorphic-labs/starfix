@@ -10,7 +10,7 @@ import pyarrow as pa
 import pytest
 
 import starfix
-from _support import read_ipc
+from _support import options_of, read_ipc
 
 GOLDEN = Path(__file__).resolve().parents[2] / "tests" / "golden" / "format2_v0.5.json"
 
@@ -20,11 +20,7 @@ def _vectors():
 
 
 def _options(v):
-    return {
-        "include_metadata": v["include_metadata"],
-        "ordered_columns": v["ordered_columns"],
-        "ordered_struct_fields": v["ordered_struct_fields"],
-    }
+    return options_of(v)  # the float options included
 
 
 def _read(v):

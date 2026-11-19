@@ -15,6 +15,9 @@ GOLDEN = Path(__file__).resolve().parents[2] / "tests" / "golden" / "format2_v0.
 
 OPTION_NAMES = ("include_metadata", "ordered_columns", "ordered_struct_fields")
 OPTION_SETS = [dict(zip(OPTION_NAMES, values)) for values in itertools.product([False, True], repeat=3)]
+# The float options (ITL-1252): not in starfix-python 0.5, not in OPTION_SETS (the differential
+# runs compare with starfix-python); a golden vector without them has them off.
+FLOAT_OPTION_NAMES = ("normalize_negative_zero", "normalize_nan")
 
 
 def option_id(options: dict) -> str:
@@ -26,7 +29,15 @@ def golden_vectors() -> list[dict]:
 
 
 def options_of(vector: dict) -> dict:
-    return {name: vector[name] for name in OPTION_NAMES}
+    """The keyword options of a golden vector, the float options included."""
+    options = {name: vector[name] for name in OPTION_NAMES}
+    options.update({name: vector.get(name, False) for name in FLOAT_OPTION_NAMES})
+    return options
+
+
+def array_options(options: dict) -> dict:
+    """The options `hash_array` takes: all but ``include_metadata``."""
+    return {k: v for k, v in options.items() if k != "include_metadata"}
 
 
 def read_ipc(vector: dict) -> tuple[pa.Schema, list[pa.RecordBatch]]:

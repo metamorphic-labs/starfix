@@ -40,6 +40,7 @@ mod tests {
                     ordered_columns: flags & 1 != 0,
                     ordered_struct_fields: flags & 2 != 0,
                     include_metadata,
+                    ..HasherConfig::default()
                 };
                 assert_eq!(
                     ArrowDigester::hash_array_with_config(hidden.as_ref(), config),
