@@ -137,7 +137,7 @@ Add the `starfix` crate to your Rust project:
 cargo add starfix
 ```
 
-The current repository implements hash format 2, introduced in Starfix 0.5.0.
+Starfix 0.5.0 and later implement hash format 2.
 
 ### Python
 
@@ -155,7 +155,7 @@ Or with pip: `python -m pip install starfix`.
 
 Wheels are published for Linux (x86_64 and aarch64, glibc and musl), macOS (universal2), and Windows (x64). On other platforms, the source distribution builds with a Rust toolchain.
 
-To build the current repository's Python binding in a development environment:
+To build the Python binding from source in a development environment:
 
 ```bash
 python -m pip install maturin "pyarrow>=14"
@@ -455,7 +455,7 @@ Every Starfix hash consists of 35 bytes:
 [ 3-byte format version ][ 32-byte SHA-256 digest ]
 ```
 
-The current repository uses hash format 2:
+Starfix 0.5.0 and later use hash format 2:
 
 ```text
 00 00 02
@@ -469,7 +469,7 @@ Hash format 2 is documented byte-for-byte and validated against a set of golden 
 
 The Rust implementation and the corresponding format-2 `starfix-python` implementation produce identical hashes for the defined format, with one known exception: `starfix-python` 0.5.0 hashes a dictionary of sliced nested fixed-size lists incorrectly (a pyarrow `take()` defect).
 
-The Python binding in this repository uses the Rust hashing implementation and exposes a compatible Python interface.
+From 0.6.0, the `starfix` Python package uses the Rust hashing implementation and exposes a compatible Python interface.
 
 ### Legacy compatibility
 
@@ -513,7 +513,7 @@ Starfix includes tests for its logical-hashing invariants, including:
 - Hash-format conformance
 - Cross-implementation compatibility through golden vectors
 
-The repository includes exhaustive small-input testing across supported type families, along with targeted regression tests for historically problematic cases.
+The test suite includes exhaustive small-input testing across supported type families, along with targeted regression tests for historically problematic cases.
 
 Run the Rust test suite with:
 
